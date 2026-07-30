@@ -1090,6 +1090,7 @@ interface PhotoEntry {
 function ExistingPhotos({ person, onDeleted }: { person: Person; onDeleted: () => void }) {
   const [deleting, setDeleting] = useState<number | null>(null)
   const [settingPrimary, setSettingPrimary] = useState<number | null>(null)
+  const [reembedding, setReembedding] = useState<number | null>(null)
   const [localPhotos, setLocalPhotos] = useState(person.photos ?? [])
   const [confirmState, setConfirmState] = useState<{
     isOpen: boolean;
@@ -1142,6 +1143,29 @@ function ExistingPhotos({ person, onDeleted }: { person: Person; onDeleted: () =
     }
   }
 
+  const handleReembed = async (photoId: number) => {
+    setReembedding(photoId)
+    try {
+      const res = await apiFetch<{ success: boolean; error?: string; issues?: string[]; suggestion?: string }>(
+        `/persons/${person.id}/photos/${photoId}/reembed`, { method: 'POST' }
+      )
+      if (res.success) {
+        setLocalPhotos(prev => prev.map(p => p.id === photoId ? { ...p, has_embedding: true } : p))
+        onDeleted()
+      } else {
+        setAlertState({
+          isOpen: true,
+          title: 'Не удалось извлечь эмбеддинг',
+          message: (res.issues?.join('; ') || res.error || 'Неизвестная ошибка') + (res.suggestion ? `\n\n${res.suggestion}` : ''),
+        })
+      }
+    } catch (e: any) {
+      setAlertState({ isOpen: true, title: 'Ошибка', message: 'Ошибка: ' + e.message })
+    } finally {
+      setReembedding(null)
+    }
+  }
+
   if (localPhotos.length === 0) return null
 
   return (
@@ -1172,23 +1196,36 @@ function ExistingPhotos({ person, onDeleted }: { person: Person; onDeleted: () =
                   ГЛАВНОЕ
                 </div>
               )}
-              {settingPrimary === ph.id && (
-                <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-                  <RefreshCw size={14} className="text-white animate-spin" />
-                </div>
-              )}
-            </div>
-            {/* Кнопка удаления */}
-            <button
-              onClick={() => handleDelete(ph.id)}
-              disabled={deleting === ph.id}
-              className="absolute top-1 right-1 bg-black/70 hover:bg-kraken-red rounded-full p-0.5 text-white opacity-0 group-hover:opacity-100 transition-opacity disabled:opacity-50"
-              title="Удалить фото"
-            >
-              {deleting === ph.id
-                ? <RefreshCw size={10} className="animate-spin" />
-                : <X size={10} />}
-            </button>
+               {settingPrimary === ph.id && (
+                 <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+                   <RefreshCw size={14} className="text-white animate-spin" />
+                 </div>
+               )}
+             </div>
+             {/* Кнопка удаления */}
+             <button
+               onClick={() => handleDelete(ph.id)}
+               disabled={deleting === ph.id}
+               className="absolute top-1 right-1 bg-black/70 hover:bg-kraken-red rounded-full p-0.5 text-white opacity-0 group-hover:opacity-100 transition-opacity disabled:opacity-50"
+               title="Удалить фото"
+             >
+               {deleting === ph.id
+                 ? <RefreshCw size={10} className="animate-spin" />
+                 : <X size={10} />}
+             </button>
+             {/* Кнопка повторного извлечения эмбеддинга (только для фото без эмбеддинга) */}
+             {!ph.has_embedding && (
+               <button
+                 onClick={() => handleReembed(ph.id)}
+                 disabled={reembedding === ph.id || deleting === ph.id}
+                 className="absolute top-1 left-1 bg-black/70 hover:bg-kraken-purple rounded-full p-0.5 text-white opacity-0 group-hover:opacity-100 transition-opacity disabled:opacity-50"
+                 title="Повторно извлечь эмбеддинг"
+               >
+                 {reembedding === ph.id
+                   ? <RefreshCw size={10} className="animate-spin" />
+                   : <RefreshCw size={10} />}
+               </button>
+             )}
           </div>
         ))}
       </div>
@@ -1237,6 +1274,7 @@ function PersonModal({ person, onClose, onSaved }: ModalProps) {
   const [photos, setPhotos] = useState<PhotoEntry[]>([])
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [warning, setWarning] = useState<any>(null)
   const [photoTab, setPhotoTab] = useState<PhotoTab>('upload')
 
   // Duplicate check state
@@ -1325,7 +1363,7 @@ function PersonModal({ person, onClose, onSaved }: ModalProps) {
     const finalName = name.trim() || (photos.length > 0
       ? photos[0].file.name.replace(/\.[^/.]+$/, '').replace(/[_\-]+/g, ' ').trim() : '')
     if (!finalName) { setError('Введите имя или добавьте фото с именем файла'); return }
-    setSaving(true); setError('')
+    setSaving(true); setError(''); setWarning(null)
 
     // For NEW person: check if name already exists → ask user what to do
     if (!person && duplicateCheck === null) {
@@ -1353,18 +1391,22 @@ function PersonModal({ person, onClose, onSaved }: ModalProps) {
       address: address || null, extra_info: extraInfo || null,
     }
     try {
+      let savedPerson: any = null
       if (person) {
         await apiFetch(`/persons/${person.id}`, { method: 'PUT', body: JSON.stringify(extraData) })
         if (photos.length > 0) {
           const fd = new FormData()
           photos.forEach(p => fd.append('photos', p.file))
-          await apiUpload(`/persons/${person.id}/photos`, fd)
+          savedPerson = await apiUpload(`/persons/${person.id}/photos`, fd)
         }
       } else {
         const fd = new FormData()
         Object.entries(extraData).forEach(([k, v]) => { if (v != null) fd.append(k, String(v)) })
         photos.forEach(p => fd.append('photos', p.file))
-        await apiUpload('/persons/', fd)
+        savedPerson = await apiUpload('/persons/', fd)
+      }
+      if (savedPerson?._warning) {
+        setWarning(savedPerson._warning)
       }
       onSaved()
     } catch (e: any) { setError(e.message) }
@@ -1373,14 +1415,17 @@ function PersonModal({ person, onClose, onSaved }: ModalProps) {
 
   const handleMergeWithExisting = async (existingPersonId: number) => {
     // Create new person first, then merge into existing
-    setSaving(true); setError('')
+    setSaving(true); setError(''); setWarning(null)
     const finalName = name.trim() || (photos.length > 0
       ? photos[0].file.name.replace(/\.[^/.]+$/, '').replace(/[_\-]+/g, ' ').trim() : '')
     try {
       // Add photos to existing person directly
       const fd = new FormData()
       photos.forEach(p => fd.append('photos', p.file))
-      await apiUpload(`/persons/${existingPersonId}/photos`, fd)
+      const saved = await apiUpload(`/persons/${existingPersonId}/photos`, fd)
+      if (saved?._warning) {
+        setWarning(saved._warning)
+      }
       onSaved()
     } catch (e: any) { setError(e.message) }
     finally { setSaving(false); setDuplicateCheck(null) }
@@ -1690,6 +1735,25 @@ function PersonModal({ person, onClose, onSaved }: ModalProps) {
 
           {error && <div className="text-kraken-red text-sm">{error}</div>}
 
+          {warning && (
+            <div className={`p-3 rounded-lg text-xs leading-relaxed ${
+              warning.level === 'error'
+                ? 'bg-kraken-red/10 border border-kraken-red/30 text-kraken-red'
+                : 'bg-kraken-orange/10 border border-kraken-orange/30 text-kraken-orange'
+            }`}>
+              <div className="font-semibold mb-1">{warning.message}</div>
+              {warning.failed_photos?.map((p: any) => (
+                <div key={p.photo_path} className="mt-1">
+                  • {p.photo_path.split('/').pop()}: {p.error}
+                  {p.issues?.length > 0 && ` (${p.issues.join(', ')})`}
+                </div>
+              ))}
+              {warning.suggestion && (
+                <div className="mt-2 opacity-80">💡 {warning.suggestion}</div>
+              )}
+            </div>
+          )}
+
           <div className="flex gap-3 mt-2">
             <button onClick={onClose} className="btn-ghost flex-1">Отмена</button>
             <button onClick={handleSave} disabled={saving} className="btn-primary flex-1">
@@ -1716,6 +1780,7 @@ function AddExtraPhotoModal({ person, onClose, onSaved }: AddExtraPhotoProps) {
   const [saving, setSaving] = useState(false)
   const [result, setResult] = useState<{ added: number; total: number } | null>(null)
   const [error, setError] = useState('')
+  const [warning, setWarning] = useState<any>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   const handleFile = (file: File | null) => {
@@ -1729,14 +1794,17 @@ function AddExtraPhotoModal({ person, onClose, onSaved }: AddExtraPhotoProps) {
 
   const handleSave = async () => {
     if (!photo) { setError('Выберите фото'); return }
-    setSaving(true); setError('')
+    setSaving(true); setError(''); setWarning(null)
     try {
       const fd = new FormData()
       fd.append('photos', photo)
-      const res = await apiUpload<{ added_embeddings: number; total_embeddings: number }>(
+      const res = await apiUpload<any>(
         `/persons/${person.id}/photos`, fd
       )
       setResult({ added: res.added_embeddings, total: res.total_embeddings })
+      if (res._warning) {
+        setWarning(res._warning)
+      }
     } catch (e: any) {
       setError(e.message)
     } finally { setSaving(false) }
@@ -1792,6 +1860,14 @@ function AddExtraPhotoModal({ person, onClose, onSaved }: AddExtraPhotoProps) {
             <input ref={fileRef} type="file" accept="image/*" className="hidden"
               onChange={e => handleFile(e.target.files?.[0] ?? null)} />
             {error && <div className="text-kraken-red text-xs mb-3">{error}</div>}
+            {warning && (
+              <div className="p-2 rounded-lg bg-kraken-orange/10 border border-kraken-orange/30 text-kraken-orange text-xs mb-3">
+                ⚠️ {warning.message}
+                {warning.failed_photos?.map((p: any, i: number) => (
+                  <div key={i}>• {p.error}</div>
+                ))}
+              </div>
+            )}
             <div className="flex gap-3">
               <button onClick={onClose} className="btn-ghost flex-1 text-sm">Отмена</button>
               <button onClick={handleSave} disabled={saving || !photo} className="btn-primary flex-1 text-sm">

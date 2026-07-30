@@ -17,6 +17,7 @@ export interface PersonPhoto {
   id: number
   photo_path: string
   is_primary: boolean
+  has_embedding: boolean
   created_at: string
 }
 

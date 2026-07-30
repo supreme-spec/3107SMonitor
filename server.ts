@@ -1512,6 +1512,8 @@ app.post(["/api/persons", "/api/persons/"], upload.any(), async (req, res) => {
     });
 
     // Теперь обрабатываем фотографии
+    const failedPhotos: Array<{ photo_path: string; error: string; issues: string[] }> = [];
+
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
       const photo_path = `photos/${f.filename}`;
@@ -1530,7 +1532,15 @@ app.post(["/api/persons", "/api/persons/"], upload.any(), async (req, res) => {
 
       photosList.push(personPhoto);
 
-      if (regResult.hasEmbedding) embedding_count++;
+      if (regResult.hasEmbedding) {
+        embedding_count++;
+      } else {
+        failedPhotos.push({
+          photo_path,
+          error: regResult.error || "Неизвестная ошибка",
+          issues: regResult.issues || [],
+        });
+      }
     }
 
     // Обновляем персону с photo_path и embedding_count
@@ -1548,6 +1558,31 @@ app.post(["/api/persons", "/api/persons/"], upload.any(), async (req, res) => {
       where: { id: newPerson.id },
       include: { photos: true }
     });
+
+    // Если ни один эмбеддинг не создан — предупреждаем явно
+    if (embedding_count === 0 && failedPhotos.length > 0) {
+      return res.status(201).json({
+        ...createdPerson,
+        _warning: {
+          level: "error",
+          message: "Персона создана, но распознавание НЕ будет работать — ни одно фото не прошло контроль качества",
+          failed_photos: failedPhotos,
+          suggestion: "Загрузите фото: лицо крупным планом, без наклона/поворота, хорошее освещение, одно лицо в кадре",
+        },
+      });
+    }
+
+    // Если часть фото не прошла — мягкое предупреждение
+    if (failedPhotos.length > 0) {
+      return res.status(201).json({
+        ...createdPerson,
+        _warning: {
+          level: "warning",
+          message: `Эмбеддинг создан по ${embedding_count} из ${files.length} фото. ${failedPhotos.length} фото отклонено.`,
+          failed_photos: failedPhotos,
+        },
+      });
+    }
 
     res.status(201).json(createdPerson);
   } catch (err) {
@@ -1744,6 +1779,7 @@ app.post(["/api/persons/:id/photos", "/api/persons/:id/photos/"], upload.any(), 
     }
 
     let added_embeddings = 0;
+    const failedPhotos: Array<{ photo_path: string; error: string; issues: string[] }> = [];
     for (const f of files) {
       const photo_path = `photos/${f.filename}`;
       const fullPath = path.join(publicDir, photo_path);
@@ -1755,7 +1791,15 @@ app.post(["/api/persons/:id/photos", "/api/persons/:id/photos/"], upload.any(), 
       if (isPrimary) {
         await prisma.person.update({ where: { id }, data: { photo_path } });
       }
-      if (regResult.hasEmbedding) added_embeddings++;
+      if (regResult.hasEmbedding) {
+        added_embeddings++;
+      } else {
+        failedPhotos.push({
+          photo_path,
+          error: regResult.error || "Неизвестная ошибка",
+          issues: regResult.issues || [],
+        });
+      }
     }
 
     await prisma.person.update({
@@ -1767,6 +1811,22 @@ app.post(["/api/persons/:id/photos", "/api/persons/:id/photos/"], upload.any(), 
     // Sync in-memory
     const idx = persons.findIndex((p) => p.id === id);
     if (idx >= 0) persons[idx] = { ...persons[idx], ...updated };
+
+    if (failedPhotos.length > 0) {
+      return res.json({
+        ...updated,
+        added_embeddings,
+        total_embeddings: updated?.photos.length,
+        _warning: {
+          level: failedPhotos.length === files.length ? "error" : "warning",
+          message: failedPhotos.length === files.length
+            ? `Ни одно из ${files.length} фото не прошло контроль качества. Эмбеддинг не создан.`
+            : `${added_embeddings} из ${files.length} фото прошли контроль. ${failedPhotos.length} отклонено.`,
+          failed_photos: failedPhotos,
+          suggestion: "Загрузите фото: лицо крупным планом, без наклона/поворота, хорошее освещение, одно лицо в кадре",
+        },
+      });
+    }
 
     res.json({ ...updated, added_embeddings, total_embeddings: updated?.photos.length });
   } catch (err) {
@@ -1932,6 +1992,51 @@ app.post(["/api/persons/:id/photos/:photoId/set_primary", "/api/persons/:id/phot
   }
 });
 
+// ── RE-EMBED: повторное извлечение эмбеддинга для уже загруженной фотографии ──
+// Позволяет повторно попытаться извлечь эмбеддинг с жёстким воротом качества
+// для фото, которое ранее не прошло (has_embedding = false).
+app.post(["/api/persons/:id/photos/:photoId/reembed", "/api/persons/:id/photos/:photoId/reembed/"], async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const photoId = parseInt(req.params.photoId);
+
+    const photo = await prisma.personPhoto.findFirst({ where: { id: photoId, person_id: id } });
+    if (!photo) return res.status(404).json({ detail: "Фото не найдено" });
+
+    const person = await prisma.person.findUnique({ where: { id } });
+    if (!person) return res.status(404).json({ detail: "Персона не найдена" });
+
+    const fullPath = path.join(publicDir, photo.photo_path);
+    const result = await enrollPhotoWithGate(
+      id,
+      person.name,
+      person.category,
+      photo.photo_path,
+      fullPath
+    );
+
+    if (result.hasEmbedding) {
+      await prisma.personPhoto.update({ where: { id: photoId }, data: { has_embedding: true } });
+      const newCount = await prisma.personPhoto.count({ where: { person_id: id, has_embedding: true } });
+      await prisma.person.update({ where: { id }, data: { embedding_count: newCount } });
+      const updated = await prisma.person.findUnique({ where: { id }, include: { photos: true } });
+      const idx = persons.findIndex((p) => p.id === id);
+      if (idx >= 0) persons[idx] = { ...persons[idx], ...updated };
+      return res.json({ success: true, embedding_count: newCount, person: updated });
+    }
+
+    return res.status(422).json({
+      success: false,
+      error: result.error,
+      issues: result.issues,
+      suggestion: "Попробуйте другое фото: лицо крупным планом, хорошее освещение, без наклона",
+    });
+  } catch (err) {
+    logError(err as Error, { path: "/api/persons/:id/photos/:photoId/reembed", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
 // ── ORPHAN PHOTOS CLEANUP ──
 // Удаляет фото персон, у которых нет эмбеддингов (has_embedding = false).
 // Используется для очистки «мусорных» кадров, которые не прошли ворот качества.
@@ -2086,7 +2191,7 @@ async function enrollPhotoWithGate(
   category: string,
   photo_path: string,
   fullPath: string
-): Promise<{ hasEmbedding: boolean; error?: string }> {
+): Promise<{ hasEmbedding: boolean; error?: string; issues?: string[]; quality?: any }> {
   const ext = await extractEmbedding(fullPath, { strict: true });
 
   if (!ext.passed || !ext.descriptor) {
@@ -2094,11 +2199,11 @@ async function enrollPhotoWithGate(
     await recordFailedEmbedding({
       photo_path,
       filename: path.basename(photo_path),
-      reason: ext.issues.length ? ext.issues.join("; ") : (ext.error || "Лицо не обнаружено на фото"),
+      reason: ext.issues.join("; ") || ext.error || "Лицо не обнаружено на фото",
       detected_faces: q?.face_count ?? 0,
       quality_score: q?.score ?? 0,
     });
-    return { hasEmbedding: false, error: ext.issues.join("; ") || ext.error };
+    return { hasEmbedding: false, error: ext.issues.join("; ") || ext.error, issues: ext.issues, quality: ext.quality };
   }
 
   const reg = await registerPersonFromDescriptor(personId, personName, category, photo_path, ext.descriptor);
