@@ -5167,3 +5167,302 @@ start().catch((err) => {
   console.error('❌ FATAL: start() failed:', err);
   process.exit(1);
 });
+
+// ── Sprint 6.5: API для Multi-Operator Verification System ───────────────────
+
+// Список инцидентов (RecognitionIncident)
+app.get(["/api/incidents", "/api/incidents/"], async (req, res) => {
+  try {
+    const status = req.query.status as string;
+    const where: any = {};
+    if (status) where.status = status;
+
+    const incidents = await prisma.recognitionIncident.findMany({
+      where,
+      orderBy: { created_at: "desc" },
+      include: {
+        decisions: { include: { operator: true } },
+      },
+    });
+
+    res.json(incidents);
+  } catch (err) {
+    logError(err as Error, { path: "/api/incidents", method: "GET" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Получение одного инцидента
+app.get("/api/incidents/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const incident = await prisma.recognitionIncident.findUnique({
+      where: { id },
+      include: {
+        decisions: { include: { operator: true } },
+      },
+    });
+
+    if (!incident) return res.status(404).json({ detail: "Incident not found" });
+
+    res.json(incident);
+  } catch (err) {
+    logError(err as Error, { path: "/api/incidents/:id", method: "GET" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Создание нового инцидента
+app.post(["/api/incidents", "/api/incidents/"], async (req, res) => {
+  try {
+    const { original_photo_path, ai_candidate_person_id, ai_confidence, status = "OPEN", source_event_id } = req.body;
+
+    const incident = await prisma.recognitionIncident.create({
+      data: {
+        original_photo_path,
+        ai_candidate_person_id: ai_candidate_person_id ? parseInt(ai_candidate_person_id) : null,
+        ai_confidence,
+        status,
+        source_event_id: source_event_id ? parseInt(source_event_id) : null,
+      },
+    });
+
+    res.status(201).json(incident);
+  } catch (err) {
+    logError(err as Error, { path: "/api/incidents", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Обновление статуса инцидента
+app.put("/api/incidents/:id/status", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { status } = req.body;
+
+    const updated = await prisma.recognitionIncident.update({
+      where: { id },
+      data: { status },
+    });
+
+    res.json(updated);
+  } catch (err) {
+    logError(err as Error, { path: "/api/incidents/:id/status", method: "PUT" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Закрытие инцидента (решение)
+app.post("/api/incidents/:id/close", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { decision, comment, screen_path, operator_login } = req.body;
+
+    // Создаём вердикт оператора
+    const operator = await prisma.operator.findUnique({ where: { login: operator_login } });
+    if (!operator) return res.status(404).json({ detail: "Operator not found" });
+
+    const incident = await prisma.recognitionIncident.update({
+      where: { id },
+      data: {
+        status: decision === "CONFIRM" ? "CONFIRMED" : decision === "REJECT" ? "REJECTED" : "NEEDS_REVIEW",
+        resolved_at: new Date(),
+        decisions: {
+          create: {
+            operator_id: operator.id,
+            decision,
+            comment,
+            screen_path,
+          },
+        },
+      },
+      include: { decisions: true },
+    });
+
+    res.json(incident);
+  } catch (err) {
+    logError(err as Error, { path: "/api/incidents/:id/close", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Список операторов
+app.get(["/api/operators", "/api/operators/"], async (req, res) => {
+  try {
+    const operators = await prisma.operator.findMany({ orderBy: { created_at: "asc" } });
+    res.json(operators);
+  } catch (err) {
+    logError(err as Error, { path: "/api/operators", method: "GET" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Создание оператора
+app.post(["/api/operators", "/api/operators/"], async (req, res) => {
+  try {
+    const { login, display_name, role = "reviewer", active = true } = req.body;
+
+    const operator = await prisma.operator.create({
+      data: { login, display_name, role, active },
+    });
+
+    res.status(201).json(operator);
+  } catch (err) {
+    logError(err as Error, { path: "/api/operators", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// ── Sprint 6.5: API для Reliable Archive Builder ─────────────────────────────
+
+// Список сессий импорта
+app.get(["/api/import-sessions", "/api/import-sessions/"], async (req, res) => {
+  try {
+    const sessions = await prisma.importSession.findMany({
+      orderBy: { start_time: "desc" },
+      include: { tasks: true },
+    });
+    res.json(sessions);
+  } catch (err) {
+    logError(err as Error, { path: "/api/import-sessions", method: "GET" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Создание новой сессии импорта
+app.post(["/api/import-sessions", "/api/import-sessions/"], async (req, res) => {
+  try {
+    const { operator_login, workspace, machine_name, app_version, model_version, gpu, cpu, workspace_version, total_files = 0 } = req.body;
+
+    const session = await prisma.importSession.create({
+      data: {
+        operator_login,
+        workspace,
+        machine_name,
+        app_version,
+        model_version,
+        gpu,
+        cpu,
+        workspace_version,
+        total_files,
+      },
+    });
+
+    res.status(201).json(session);
+  } catch (err) {
+    logError(err as Error, { path: "/api/import-sessions", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Статус сессии импорта
+app.get("/api/import-sessions/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const session = await prisma.importSession.findUnique({
+      where: { id },
+      include: { tasks: true },
+    });
+
+    if (!session) return res.status(404).json({ detail: "ImportSession not found" });
+
+    res.json(session);
+  } catch (err) {
+    logError(err as Error, { path: "/api/import-sessions/:id", method: "GET" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Завершение сессии импорта
+app.post("/api/import-sessions/:id/complete", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { completed, rejected, errors, status = "COMPLETED" } = req.body;
+
+    const session = await prisma.importSession.update({
+      where: { id },
+      data: { completed, rejected, errors, status, ended_at: new Date() },
+    });
+
+    res.json(session);
+  } catch (err) {
+    logError(err as Error, { path: "/api/import-sessions/:id/complete", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Задача архивации (ArchiveTask)
+app.post(["/api/archive-tasks", "/api/archive-tasks/"], async (req, res) => {
+  try {
+    const { photo_hash, photo_path, status = "NEW", import_session_id, embedding_error, thumbnail_error, database_error, faiss_error } = req.body;
+
+    const task = await prisma.archiveTask.create({
+      data: {
+        photo_hash,
+        photo_path,
+        status,
+        embedding_error,
+        thumbnail_error,
+        database_error,
+        faiss_error,
+        import_session_id: parseInt(import_session_id),
+      },
+    });
+
+    res.status(201).json(task);
+  } catch (err) {
+    logError(err as Error, { path: "/api/archive-tasks", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Обновление задачи архивации (checkpoint)
+app.put("/api/archive-tasks/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const updates: any = {};
+    if (req.body.status) updates.status = req.body.status;
+    if (req.body.embedding_status) updates.embedding_status = req.body.embedding_status;
+    if (req.body.thumbnail_status) updates.thumbnail_status = req.body.thumbnail_status;
+    if (req.body.database_status) updates.database_status = req.body.database_status;
+    if (req.body.faiss_status) updates.faiss_status = req.body.faiss_status;
+    if (req.body.embedding_error) updates.embedding_error = req.body.embedding_error;
+    if (req.body.thumbnail_error) updates.thumbnail_error = req.body.thumbnail_error;
+    if (req.body.database_error) updates.database_error = req.body.database_error;
+    if (req.body.faiss_error) updates.faiss_error = req.body.faiss_error;
+    if (req.body.attempt !== undefined) updates.attempt = req.body.attempt;
+    if (req.body.retry_count !== undefined) updates.retry_count = req.body.retry_count;
+    if (req.body.last_error) updates.last_error = req.body.last_error;
+    if (req.body.processing_time_ms !== undefined) updates.processing_time_ms = req.body.processing_time_ms;
+    if (req.body.embedding_time_ms !== undefined) updates.embedding_time_ms = req.body.embedding_time_ms;
+    if (req.body.quality_score !== undefined) updates.quality_score = req.body.quality_score;
+
+    const task = await prisma.archiveTask.update({
+      where: { id },
+      data: updates,
+    });
+
+    res.json(task);
+  } catch (err) {
+    logError(err as Error, { path: "/api/archive-tasks/:id", method: "PUT" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// Проверка статуса фото в архиве (дедуп + resume)
+app.post(["/api/archive-tasks/check", "/api/archive-tasks/check/"], async (req, res) => {
+  try {
+    const { photo_hash, import_session_id } = req.body;
+
+    const task = await prisma.archiveTask.findFirst({
+      where: { photo_hash, import_session_id: parseInt(import_session_id) },
+    });
+
+    if (!task) return res.json({ exists: false });
+
+    res.json({ exists: true, task });
+  } catch (err) {
+    logError(err as Error, { path: "/api/archive-tasks/check", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});

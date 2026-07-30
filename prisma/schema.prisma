@@ -253,57 +253,60 @@ model FaissUpdateLog {
   status      String
 }
 
-// ── Sprint 6.5: Multi Operator Verification System ───────────────────────────
+// ── Sprint 6.5: Multi Operator Verification System (v3) ──────────────────────
 
 model Operator {
   id           Int                @id @default(autoincrement())
-  name         String
-  email        String             @unique
-  roles        String             @default("reviewer") // reviewer, admin
+  login        String             @unique
+  display_name String
+  role         String             @default("reviewer") // reviewer, admin, validator
+  active       Boolean            @default(true)
   created_at   DateTime           @default(now())
-  decisions    OperatorDecision[]
+  decisions    OperatorVerdict[]
 }
 
-model RecognitionCase {
+model RecognitionIncident {
   id                       Int                @id @default(autoincrement())
   original_photo_path      String
   ai_candidate_person_id   Int?
   ai_confidence            Float
   status                   String             @default("OPEN") // OPEN, WAITING_OPERATORS, PARTIAL_RESULT, CONFIRMED, REJECTED, NEEDS_REVIEW
-  confirm_count            Int                @default(0)
-  reject_match_count       Int                @default(0)
-  ai_error_count           Int                @default(0)
-  review_count             Int                @default(0)
   created_at               DateTime           @default(now())
   resolved_at              DateTime?
-  decisions                OperatorDecision[]
+  decisions                OperatorVerdict[]
   source_event_id          Int?               @unique
 }
 
-model OperatorDecision {
+model OperatorVerdict {
   id             Int              @id @default(autoincrement())
-  case_id        Int
+  incident_id    Int
   operator_id    Int
-  decision       String           // CONFIRM, REJECT_MATCH, AI_ERROR, NEEDS_REVIEW
+  decision       String           // CONFIRM, REJECT, AI_ERROR, UNKNOWN, NEEDS_REVIEW
   screen_path    String?
   comment        String?
   timestamp      DateTime         @default(now())
   
-  case           RecognitionCase  @relation(fields: [case_id], references: [id])
+  incident       RecognitionIncident @relation(fields: [incident_id], references: [id])
   operator       Operator         @relation(fields: [operator_id], references: [id])
   
-  @@index([case_id])
+  @@index([incident_id])
   @@index([operator_id])
   @@index([decision])
 }
 
-// ── Sprint 6.5: Reliable Archive Builder ─────────────────────────────────────
+// ── Sprint 6.5: Reliable Archive Builder (v3) ────────────────────────────────
 
 model ImportSession {
   id                       Int             @id @default(autoincrement())
   start_time               DateTime        @default(now())
-  operator                 String?
+  operator_login           String?
   workspace                String
+  machine_name             String?
+  app_version              String?
+  model_version            String?
+  gpu                      String?
+  cpu                      String?
+  workspace_version        String?
   total_files              Int             @default(0)
   completed                Int             @default(0)
   rejected                 Int             @default(0)
@@ -316,24 +319,45 @@ model ImportSession {
 }
 
 model ArchiveTask {
-  id                    Int       @id @default(autoincrement())
-  photo_hash            String    // SHA-256
-  photo_path            String
-  status                String    @default("NEW") // NEW, LOADED, FACE_DETECTED, EMBEDDING_CREATED, THUMBNAIL_CREATED, DATABASE_SAVED, FAISS_INDEXED, COMPLETED
-  embedding_status      String    @default("PENDING") // PENDING, OK, FAILED
-  thumbnail_status      String    @default("PENDING")
-  database_status       String    @default("PENDING")
-  faiss_status          String    @default("PENDING")
-  embedding_error       String?
-  thumbnail_error       String?
-  database_error        String?
-  faiss_error           String?
-  created_at            DateTime  @default(now())
-  updated_at            DateTime  @updatedAt
-  import_session_id     Int
-  import_session        ImportSession @relation(fields: [import_session_id], references: [id])
+  id                   Int               @id @default(autoincrement())
+  photo_hash           String            // SHA-256
+  photo_path           String
+  status               String            @default("NEW") // NEW, LOADED, FACE_DETECTED, EMBEDDING_CREATED, THUMBNAIL_CREATED, DATABASE_SAVED, FAISS_INDEXED, COMPLETED
+  embedding_error      String?
+  thumbnail_error      String?
+  database_error       String?
+  faiss_error          String?
+  attempt              Int               @default(0)
+  retry_count          Int               @default(0)
+  last_error           String?
+  processing_time_ms   Int?
+  embedding_time_ms    Int?
+  quality_score        Float?
+  created_at           DateTime          @default(now())
+  updated_at           DateTime          @updatedAt
+  import_session_id    Int
+  import_session       ImportSession     @relation(fields: [import_session_id], references: [id])
+  steps                ArchiveTaskStep[]
   
   @@index([photo_hash])
   @@index([status])
   @@index([import_session_id])
+}
+
+model ArchiveTaskStep {
+  id              Int        @id @default(autoincrement())
+  task_id         Int
+  step            String     // EMBEDDING, THUMBNAIL, DATABASE, FAISS, CROP, QUALITY, METADATA
+  status          String     @default("PENDING") // PENDING, IN_PROGRESS, OK, FAILED
+  started_at      DateTime?
+  finished_at     DateTime?
+  error           String?
+  created_at      DateTime   @default(now())
+  updated_at      DateTime   @updatedAt
+  
+  task            ArchiveTask @relation(fields: [task_id], references: [id], onDelete: Cascade)
+  
+  @@index([task_id])
+  @@index([step])
+  @@index([status])
 }
