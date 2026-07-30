@@ -47,8 +47,11 @@ test_cyr.pdf
 # ML model weights (fetch later via download_models.py / download_buffalo_l.py)
 models/
 
-# Python
-__pycache__/
+# FFmpeg binaries (downloaded separately)
+ffmpeg_extracted/
 *.pyc
 *.pyo
+venv_new/
+*.egg-info/
+.pytest_cache/
 

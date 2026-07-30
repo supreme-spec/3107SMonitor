@@ -18,8 +18,28 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
+# ─── CPU Optimization for Intel i5-10400 ──────────────────────────────────────
+# Must be set BEFORE numpy/onnxruntime import
+_cpu_count = os.cpu_count() or 4
+if "OMP_NUM_THREADS" not in os.environ:
+    os.environ["OMP_NUM_THREADS"] = str(min(6, _cpu_count))
+if "ORT_NUM_THREADS" not in os.environ:
+    os.environ["ORT_NUM_THREADS"] = str(min(6, _cpu_count))
+
 import cv2
 import numpy as np
+
+# ── v2: distance estimation helpers ──
+try:
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location("distance", "face_server/distance.py")
+    distance_mod = importlib.util.module_from_spec(spec)
+    sys.modules["distance"] = distance_mod
+    spec.loader.exec_module(distance_mod)
+    estimate_depth_m = distance_mod.estimate_depth_m
+    bbox_in_roi_polygon = distance_mod.bbox_in_roi_polygon
+except Exception:
+    pass
 import faiss
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
@@ -38,10 +58,14 @@ COOLDOWN_SECONDS: int = int(os.getenv("FACE_COOLDOWN_SECONDS", "30"))
 RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "45")) / 100
 CONFIRMATION_THRESHOLD: float = float(os.getenv("FACE_CONFIRMATION_THRESHOLD", "55")) / 100
 LOW_THRESHOLD: float = float(os.getenv("FACE_LOW_THRESHOLD", "40")) / 100
+
+INFERENCE_TIMEOUT_SECONDS: int = int(os.getenv("FACE_INFERENCE_TIMEOUT_SECONDS", "20"))
 # Пороги для ИЗВЛЕЧЕНИЯ ЭМБЕДДИНГА (регистрация/обучение) — максимально мягкие:
 # здесь мы ХОТИМ вытащить вектор даже из неидеального кадра (размытие/поворот/темнота).
 EMBED_MIN_DET_SCORE: float = float(os.getenv("FACE_EMBED_MIN_DET_SCORE", "0.35"))
 EMBED_MIN_FACE_SIZE: int = int(os.getenv("FACE_EMBED_MIN_FACE_SIZE", "28"))
+# Максимальный размер лица для детекции (0 = отключено).
+MAX_FACE_SIZE: int = int(os.getenv("FACE_MAX_FACE_SIZE", "0"))
 
 # ── ПОРОГИ КАЧЕСТВА ДЛЯ ВОРОТ (ENROLLMENT GATE) ───────────────────────────────
 # Жёсткие пороги при ЗАПИСИ РЕФЕРЕНСНОГО эмбеддинга. Мусорные кадры (размытие,
@@ -66,6 +90,38 @@ DB_PATH: str = os.getenv("DB_PATH", "prisma/dev.db")
 
 logging.basicConfig(level=logging.INFO, format="[FaceEngine] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+# ─── Zone filters (fraction of frame width/height) ─────────────────────────────
+# Passage ROI where the guest should appear.
+PASSAGE_ROI = {
+    "x_min": 0.30,
+    "x_max": 0.65,
+    "y_min": 0.10,
+    "y_max": 0.80,
+}
+# Left-side ignore zone where the guard stands.
+GUARD_IGNORE_ZONE = {
+    "x_min": 0.00,
+    "x_max": 0.30,
+    "y_min": 0.00,
+    "y_max": 1.00,
+}
+
+def is_valid_face_position(face_bbox, frame_width: int, frame_height: int) -> bool:
+    x1, y1, x2, y2 = [int(v) for v in face_bbox[:4]]
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    nx = cx / max(1, frame_width)
+    ny = cy / max(1, frame_height)
+    in_passage = (
+        PASSAGE_ROI["x_min"] <= nx <= PASSAGE_ROI["x_max"]
+        and PASSAGE_ROI["y_min"] <= ny <= PASSAGE_ROI["y_max"]
+    )
+    in_guard = (
+        GUARD_IGNORE_ZONE["x_min"] <= nx <= GUARD_IGNORE_ZONE["x_max"]
+        and GUARD_IGNORE_ZONE["y_min"] <= ny <= GUARD_IGNORE_ZONE["y_max"]
+    )
+    return in_passage and not in_guard
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -346,22 +402,29 @@ def load_image_from_bytes(data: bytes) -> Optional[np.ndarray]:
 
 # ─── Quality Gate ─────────────────────────────────────────────────────────────
 
-def passes_quality_gate(face: Any) -> bool:
+def passes_quality_gate(face: Any, strict: bool = False) -> bool:
     """
     Filters low-quality detections before embedding extraction.
     Rejects:
-      - det_score < MIN_DETECTION_SCORE
-      - face width < MIN_FACE_SIZE
+      - det_score < MIN_DETECTION_SCORE (live) or < EMBED_MIN_DET_SCORE (enrollment)
+      - face width < MIN_FACE_SIZE (live) or < EMBED_MIN_FACE_SIZE (enrollment)
+      - face width > MAX_FACE_SIZE (when enabled)
     """
     score = float(face.det_score) if hasattr(face, "det_score") else 0.0
-    if score < MIN_DETECTION_SCORE:
-        logger.debug(f"Quality gate: score {score:.3f} < {MIN_DETECTION_SCORE}")
+    min_score = EMBED_MIN_DET_SCORE if strict else MIN_DETECTION_SCORE
+    if score < min_score:
+        logger.debug(f"Quality gate: score {score:.3f} < {min_score}")
         return False
 
     bbox = face.bbox.astype(int).tolist()
     width = int(bbox[2] - bbox[0])
-    if width < MIN_FACE_SIZE:
-        logger.debug(f"Quality gate: width {width} < {MIN_FACE_SIZE}")
+    min_size = EMBED_MIN_FACE_SIZE if strict else MIN_FACE_SIZE
+    if width < min_size:
+        logger.debug(f"Quality gate: width {width} < {min_size}")
+        return False
+
+    if MAX_FACE_SIZE > 0 and width > MAX_FACE_SIZE:
+        logger.debug(f"Quality gate: width {width} > MAX_FACE_SIZE {MAX_FACE_SIZE}")
         return False
 
     return True
@@ -615,6 +678,20 @@ async def get_health() -> Dict[str, Any]:
     }
 
 
+async def run_inference_with_timeout(name: str, func, *args, **kwargs):
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(func, *args, **kwargs),
+            timeout=INFERENCE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"Inference timeout: {name} exceeded {INFERENCE_TIMEOUT_SECONDS}s")
+        raise HTTPException(status_code=504, detail=f"{name} timeout")
+    except Exception as e:
+        logger.error(f"Inference error: {name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/detect-faces", dependencies=[Depends(verify_api_key)])
 async def detect_faces(
     image: UploadFile = File(...),
@@ -634,8 +711,16 @@ async def detect_faces(
         if img is None or img.size == 0:
             raise HTTPException(status_code=400, detail="Empty or invalid image")
 
+        height, width = img.shape[:2]
+        if width < 1280 or height < 720:
+            logger.warning(
+                "Низкое разрешение кадра: %dx%d. Рекомендуется минимум 1280x720, "
+                "идеально 1920x1080. Проверьте RTSP URL (должен заканчиваться на /101 или Channels/101).",
+                width, height,
+            )
+
         threshold = min_confidence if min_confidence is not None else MIN_DETECTION_SCORE
-        faces = face_app.get(img)
+        faces = await run_inference_with_timeout("detect-faces", face_app.get, img)
         results: List[Dict[str, Any]] = []
 
         for face in faces[:max_faces]:
@@ -676,6 +761,112 @@ async def detect_faces(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── v2: детекция с distance-расчётом ──
+@app.post("/detect-with-distance", dependencies=[Depends(verify_api_key)])
+async def detect_with_distance(
+    image: UploadFile = File(...),
+    max_faces: Optional[int] = 20,
+    min_confidence: Optional[float] = None,
+    with_descriptors: Optional[bool] = False,
+    distance_calib_mode: Optional[str] = None,
+    roi_polygon: Optional[str] = None,
+    distance_min_m: Optional[float] = None,
+    distance_max_m: Optional[float] = None,
+    distance_ignore_m: Optional[float] = None,
+    focal_length_px: Optional[float] = None,
+):
+    """Detects faces + estimates distance using the ladder calib method."""
+    try:
+        image_bytes = await image.read()
+        img = load_image_from_bytes(image_bytes)
+
+        if not is_initialized or face_app is None:
+            return {"faces": []}
+
+        if img is None or img.size == 0:
+            raise HTTPException(status_code=400, detail="Empty or invalid image")
+
+        height, width = img.shape[:2]
+
+        threshold = min_confidence if min_confidence is not None else MIN_DETECTION_SCORE
+        faces = await run_inference_with_timeout("detect-with-distance", face_app.get, img)
+        results: List[Dict[str, Any]] = []
+
+        # Parse camera params
+        try:
+            camera_roi_polygon = json.loads(roi_polygon) if roi_polygon else None
+        except (json.JSONDecodeError, TypeError):
+            camera_roi_polygon = None
+
+        distance_ignore = distance_ignore_m or 1.5
+        distance_min = distance_min_m or 2.0
+        distance_max = distance_max_m or 4.0
+
+        for face in faces[:max_faces]:
+            if not passes_quality_gate(face):
+                continue
+
+            box = face.bbox.astype(int).tolist()
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+            cx = (x1 + x2) / 2.0
+
+            detection: Dict[str, Any] = {
+                "box": {
+                    "x": box[0],
+                    "y": box[1],
+                    "width": box[2] - box[0],
+                    "height": box[3] - box[1],
+                },
+                "score": float(face.det_score),
+            }
+            if with_descriptors and hasattr(face, "embedding") and face.embedding is not None:
+                detection["descriptor"] = face.embedding.tolist()
+
+            # Distance estimation ladder
+            if distance_calib_mode or True:  # always try
+                try:
+                    # ROI polygon filter
+                    if camera_roi_polygon and not bbox_in_roi_polygon(box, width, height, camera_roi_polygon):
+                        continue  # skip faces outside ROI polygon (shadows/glare)
+
+                    depth, used = estimate_depth_m({
+                        "mode": distance_calib_mode,
+                        "bbox": box,
+                        "frame_w": width,
+                        "frame_h": height,
+                        "feet_px": (cx, y2),
+                        "feet_y_px": y2,
+                        "height_px": (y2 - y1) * 3.0,
+                        "homography": None,  # TODO: pass from client
+                        "person_calib": None,  # TODO: pass from client
+                        "focal_px": float(focal_length_px) if focal_length_px else None,
+                    })
+
+                    detection["distance_m"] = depth
+                    detection["depth_mode"] = used
+
+                    in_zone = False
+                    if depth is not None:
+                        if depth >= distance_ignore:
+                            in_zone = distance_min <= depth <= distance_max
+                    detection["in_zone"] = in_zone
+                except Exception:
+                    detection["distance_m"] = None
+                    detection["depth_mode"] = "error"
+                    detection["in_zone"] = False
+
+            results.append(detection)
+
+        return {"faces": results}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Detection-with-distance error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/assess-quality", dependencies=[Depends(verify_api_key)])
 async def assess_quality(image: UploadFile = File(...)):
     """
@@ -699,7 +890,15 @@ async def assess_quality(image: UploadFile = File(...)):
                 "faces": [],
             }
 
-        faces = face_app.get(img)
+        height, width = img.shape[:2]
+        if width < 1280 or height < 720:
+            logger.warning(
+                "Низкое разрешение кадра: %dx%d. Рекомендуется минимум 1280x720, "
+                "идеально 1920x1080. Проверьте RTSP URL (должен заканчиваться на /101 или Channels/101).",
+                width, height,
+            )
+
+        faces = await run_inference_with_timeout("assess-quality", face_app.get, img)
         face_count = len(faces)
         valid_faces = [f for f in faces if passes_quality_gate(f)]
 
@@ -776,12 +975,20 @@ async def get_embedding(
         if img is None or img.size == 0:
             raise HTTPException(status_code=400, detail="Empty or invalid image")
 
-        faces = face_app.get(img)
+        height, width = img.shape[:2]
+        if width < 1280 or height < 720:
+            logger.warning(
+                "Низкое разрешение кадра: %dx%d. Рекомендуется минимум 1280x720, "
+                "идеально 1920x1080. Проверьте RTSP URL (должен заканчиваться на /101 или Channels/101).",
+                width, height,
+            )
+
+        faces = await run_inference_with_timeout("get_embedding", face_app.get, img)
         if not faces:
             return {"descriptor": None, "error": "No face detected", "quality": None, "issues": ["Лицо не обнаружено"]}
 
         face = faces[0]
-        if not passes_quality_gate(face):
+        if not passes_quality_gate(face, strict=strict):
             return {"descriptor": None, "error": "Low quality face", "quality": None, "issues": ["Низкое качество детекции лица"]}
 
         face_count = len(faces)
@@ -824,6 +1031,11 @@ async def recognize(
     category: Optional[str] = "",
     threshold: Optional[float] = None,
     apply_cooldown: Optional[bool] = True,
+    passage_roi_x_min: Optional[float] = None,
+    passage_roi_x_max: Optional[float] = None,
+    passage_roi_y_min: Optional[float] = None,
+    passage_roi_y_max: Optional[float] = None,
+    guard_ignore_x_max: Optional[float] = None,
 ):
     """
     Full recognition pipeline.
@@ -842,7 +1054,15 @@ async def recognize(
         if img is None or img.size == 0:
             raise HTTPException(status_code=400, detail="Empty or invalid image")
 
-        faces = face_app.get(img)
+        height, width = img.shape[:2]
+        if width < 1280 or height < 720:
+            logger.warning(
+                "Низкое разрешение кадра: %dx%d. Рекомендуется минимум 1280x720, "
+                "идеально 1920x1080. Проверьте RTSP URL (должен заканчиваться на /101 или Channels/101).",
+                width, height,
+            )
+
+        faces = await run_inference_with_timeout("recognize", face_app.get, img)
         if not faces:
             return {"matches": [], "status": "no_faces"}
 
@@ -850,7 +1070,31 @@ async def recognize(
         if not valid_faces:
             return {"matches": [], "status": "no_valid_faces"}
 
-        primary_face = valid_faces[0]
+        # Zone filter: prefer faces inside passage ROI and outside guard ignore zone
+        roi_x_min = passage_roi_x_min if passage_roi_x_min is not None else PASSAGE_ROI["x_min"]
+        roi_x_max = passage_roi_x_max if passage_roi_x_max is not None else PASSAGE_ROI["x_max"]
+        roi_y_min = passage_roi_y_min if passage_roi_y_min is not None else PASSAGE_ROI["y_min"]
+        roi_y_max = passage_roi_y_max if passage_roi_y_max is not None else PASSAGE_ROI["y_max"]
+        guard_x_max = guard_ignore_x_max if guard_ignore_x_max is not None else GUARD_IGNORE_ZONE["x_max"]
+
+        def in_passage(bbox):
+            x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            nx = cx / max(1, width)
+            ny = cy / max(1, height)
+            return (roi_x_min <= nx <= roi_x_max) and (roi_y_min <= ny <= roi_y_max)
+
+        def in_guard_zone(bbox):
+            x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            nx = cx / max(1, width)
+            ny = cy / max(1, height)
+            return nx <= guard_x_max
+
+        zoned_faces = [f for f in valid_faces if in_passage(f.bbox) and not in_guard_zone(f.bbox)]
+        primary_face = zoned_faces[0] if zoned_faces else valid_faces[0]
         if not hasattr(primary_face, "embedding") or primary_face.embedding is None:
             return {"matches": [], "status": "no_embedding"}
 

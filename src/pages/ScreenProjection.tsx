@@ -74,7 +74,7 @@ export default function ScreenProjection() {
   // Загрузка событий (если блок включён)
   useEffect(() => {
     if (!blocks.has('events')) return
-    const load = () => apiFetch<KrakenEvent[]>('/events?limit=20').then(setEvents).catch(() => {})
+    const load = () => apiFetch<{ events: KrakenEvent[]; next_cursor: number | null }>('/events?limit=20').then(data => setEvents(data.events)).catch(() => {})
     load()
     const t = setInterval(load, 10_000)
     return () => clearInterval(t)
@@ -103,7 +103,7 @@ export default function ScreenProjection() {
             alertTimerRef.current = setTimeout(() => setAlertVisible(false), 10_000)
             // Обновляем события
             if (blocks.has('events')) {
-              apiFetch<KrakenEvent[]>('/events?limit=20').then(setEvents).catch(() => {})
+              apiFetch<{ events: KrakenEvent[]; next_cursor: number | null }>('/events?limit=20').then(data => setEvents(data.events)).catch(() => {})
             }
           }
         } catch {}

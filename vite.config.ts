@@ -14,6 +14,9 @@ export default defineConfig(() => {
     },
 
     server: {
+      host: '0.0.0.0',
+      port: 5173,
+      strictPort: true,
       hmr: process.env.DISABLE_HMR !== 'true',
       watch: process.env.DISABLE_HMR === 'true' ? null : {
         // Игнорируем постоянно меняющиеся логи/билды, чтобы не дёргать HMR лишний раз
@@ -21,6 +24,12 @@ export default defineConfig(() => {
       },
       proxy: {
         '/api': {
+          target: 'http://localhost:3000',
+          changeOrigin: true,
+          timeout: 120000,
+          proxyTimeout: 120000,
+        },
+        '/webhooks': {
           target: 'http://localhost:3000',
           changeOrigin: true,
         },

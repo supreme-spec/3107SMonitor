@@ -26,6 +26,14 @@ const USE_PYTHON_SERVER = true;
 const HEALTH_CHECK_INTERVAL_MS = Number(process.env.FACE_HEALTH_CHECK_INTERVAL) || 10_000;
 const HEALTH_CHECK_TIMEOUT_MS = Number(process.env.FACE_HEALTH_CHECK_TIMEOUT) || 5_000;
 
+const FACE_REQUEST_TIMEOUT_MS = Number(process.env.FACE_REQUEST_TIMEOUT_MS) || 60_000;
+const FACE_INFERENCE_TIMEOUT_MS = Number(process.env.FACE_INFERENCE_TIMEOUT_MS) || 20_000;
+const FACE_REQUEST_RETRIES = Number(process.env.FACE_REQUEST_RETRIES) || 3;
+const FACE_RETRY_BASE_DELAY_MS = Number(process.env.FACE_RETRY_BASE_DELAY_MS) || 1000;
+
+const CIRCUIT_BREAKER_THRESHOLD = Number(process.env.FACE_CIRCUIT_BREAKER_THRESHOLD) || 5;
+const CIRCUIT_BREAKER_COOLDOWN_MS = Number(process.env.FACE_CIRCUIT_BREAKER_COOLDOWN_MS) || 30_000;
+
 // Embedding cache
 const EMBEDDING_CACHE_TTL_MS = Number(process.env.FACE_EMBEDDING_CACHE_TTL) || 5 * 60 * 1000; // 5 мин
 
@@ -58,6 +66,9 @@ interface EmbeddingCacheEntry {
 
 let isInitialized = false;
 
+/** Конфигурация лимитов эмбеддингов */
+export const MAX_EMBEDDINGS_PER_PERSON = Number(process.env.KRAKEN_MAX_EMBEDDINGS_PER_PERSON || 15);
+
 /** Дескрипторы в памяти — partitioned по категориям для ускорения поиска */
 const storedDescriptors: Array<{
   personId: number;
@@ -66,6 +77,7 @@ const storedDescriptors: Array<{
   photoPath: string;
   descriptor: Float32Array;
   descriptorList: number[];
+  createdAt: number;
 }> = [];
 
 /** Кэш эмбеддингов: pathHash -> { descriptor, timestamp } */
@@ -78,6 +90,21 @@ let pythonServerCheckPromise: Promise<boolean> | null = null;
 
 /** Таймер периодического health check */
 let healthCheckTimer: ReturnType<typeof setInterval> | null = null;
+
+/** FAISS sync status */
+let faissSyncStatus: 'SYNCED' | 'DIRTY' | 'SYNCING' = 'SYNCED';
+let faissSyncRetryCount = 0;
+const FAISS_SYNC_MAX_RETRIES = 5;
+const FAISS_SYNC_BASE_DELAY_MS = 30_000;
+let faissSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ─── Circuit Breaker State ────────────────────────────────────────────────────
+
+type CircuitState = "closed" | "open" | "half-open";
+let circuitState: CircuitState = "closed";
+let circuitFailureCount = 0;
+let circuitLastFailureAt = 0;
+let circuitOpenedAt = 0;
 
 // ─── 1. HEALTH CHECK PYTHON-СЕРВЕРА ──────────────────────────────────────────
 
@@ -185,14 +212,42 @@ function stopHealthCheckTimer(): void {
  * Возвращает true если сервер доступен, false если нет.
  */
 async function ensurePythonServerAvailable(): Promise<boolean> {
+  if (circuitState === "open") {
+    const elapsed = Date.now() - circuitOpenedAt;
+    if (elapsed < CIRCUIT_BREAKER_COOLDOWN_MS) {
+      logWarn("Face Engine circuit breaker open; request blocked", {
+        cooldownRemainingMs: CIRCUIT_BREAKER_COOLDOWN_MS - elapsed,
+      });
+      return false;
+    }
+    circuitState = "half-open";
+    logInfo("Face Engine circuit breaker transitioning to half-open");
+  }
+
   const healthy = await checkPythonServerHealth();
-  if (!healthy) {
-    logWarn("Python-сервер недоступен, операция отложена", {
-      url: FACE_SERVER_URL,
-      lastCheck: new Date(pythonServerLastCheck).toISOString(),
+  if (healthy) {
+    if (circuitState !== "closed") {
+      logInfo("Face Engine circuit breaker closed after recovery");
+    }
+    circuitState = "closed";
+    circuitFailureCount = 0;
+    return true;
+  }
+
+  circuitFailureCount += 1;
+  circuitLastFailureAt = Date.now();
+  const isClosed = circuitState === "closed";
+  const isHalfOpen = circuitState === "half-open";
+  if (circuitFailureCount >= CIRCUIT_BREAKER_THRESHOLD && (isClosed || isHalfOpen)) {
+    circuitState = "open";
+    circuitOpenedAt = Date.now();
+    logError(new Error("Face Engine circuit breaker opened"), {
+      failureCount: circuitFailureCount,
+      threshold: CIRCUIT_BREAKER_THRESHOLD,
+      cooldownMs: CIRCUIT_BREAKER_COOLDOWN_MS,
     });
   }
-  return healthy;
+  return false;
 }
 
 // ─── 2. БИНАРНОЕ ХРАНЕНИЕ ДЕСКРИПТОРОВ ──────────────────────────────────────
@@ -352,6 +407,7 @@ async function loadDescriptorsFromDB(): Promise<void> {
           photoPath: d.photo_path,
           descriptor,
           descriptorList,
+          createdAt: new Date(d.created_at).getTime(),
         });
       } catch (parseErr) {
         logError(parseErr as Error, { context: "Парсинг дескриптора из БД", descriptorId: d.id });
@@ -566,6 +622,10 @@ export function getEngineStatus(): {
   };
 }
 
+export function getEmbeddingCountForPerson(personId: number): number {
+  return storedDescriptors.filter((d) => d.personId === personId).length;
+}
+
 // ─── API РАБОТЫ С PYTHON-СЕРВЕРОМ ────────────────────────────────────────────
 
 function getApiHeaders(): Record<string, string> {
@@ -578,7 +638,79 @@ function getApiHeaders(): Record<string, string> {
 
 async function apiFetchWithKey(input: string | URL, init: RequestInit = {}): Promise<any> {
   const headers = { ...(init.headers || {}), ...getApiHeaders() };
-  return fetch(input, { ...init, headers } as any);
+  let lastError: any;
+  let lastStatus: number | undefined;
+
+  for (let attempt = 0; attempt < FACE_REQUEST_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FACE_REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(input, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      } as any);
+
+      clearTimeout(timeoutId);
+      lastStatus = response.status;
+
+      if (!response.ok && response.status >= 500) {
+        throw new Error(`Server responded with status: ${response.status}`);
+      }
+
+      return response;
+    } catch (err) {
+      clearTimeout(timeoutId);
+      lastError = err;
+
+      const isAbort = (err as Error)?.name === "AbortError";
+      const isNetwork = !(err as Error)?.message?.includes("Server responded with status");
+      const isRetryable = isAbort || isNetwork || (lastStatus !== undefined && lastStatus >= 500);
+
+      if (attempt < FACE_REQUEST_RETRIES - 1 && isRetryable) {
+        const delay = FACE_RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+        logWarn(`Face Engine request failed (attempt ${attempt + 1}/${FACE_REQUEST_RETRIES}), retrying in ${delay}ms`, {
+          input: String(input),
+          status: lastStatus,
+          error: (err as Error).message,
+          retryable: true,
+        });
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+
+      break;
+    }
+  }
+
+  // Network errors (ECONNREFUSED, timeout, abort) — это WARN, не ERROR
+  // Они ожидаемы при старте или временной недоступности Python-сервера
+  const isNetworkError = lastError && (
+    (lastError as Error).message?.includes("fetch") ||
+    (lastError as Error).message?.includes("ECONNREFUSED") ||
+    (lastError as Error).message?.includes("ETIMEDOUT") ||
+    (lastError as Error).name === "AbortError"
+  );
+
+  if (isNetworkError) {
+    logWarn((lastError as Error).message, {
+      context: "Face Engine API request failed (network)",
+      retries: FACE_REQUEST_RETRIES,
+      lastStatus,
+      circuitState,
+      failureCount: circuitFailureCount,
+    });
+  } else {
+    logError(lastError as Error, {
+      context: "Face Engine API request failed",
+      retries: FACE_REQUEST_RETRIES,
+      lastStatus,
+      circuitState,
+      failureCount: circuitFailureCount,
+    });
+  }
+  throw lastError;
 }
 
 /**
@@ -610,7 +742,28 @@ async function getEmbeddingFromServer(
     });
 
     if (!response.ok) {
-      throw new Error(`Server responded with status: ${response.status}`);
+      const status = response.status;
+      let serverMessage: string | undefined;
+      try {
+        const errJson = await response.json();
+        serverMessage = errJson?.error || errJson?.detail;
+      } catch {
+        serverMessage = undefined;
+      }
+      const msg = serverMessage || `HTTP ${status}`;
+
+      if (status === 400) {
+        logWarn(`Python rejected image: ${msg}`);
+        return {
+          descriptor: null,
+          quality: null,
+          issues: [msg],
+          passed: false,
+          error: msg,
+        };
+      }
+
+      throw new Error(`Face server error ${status}: ${msg}`);
     }
 
     const result = await response.json() as {
@@ -629,7 +782,17 @@ async function getEmbeddingFromServer(
       error: result.error,
     };
   } catch (e) {
-    logError(e as Error, { context: "Получение эмбеддинга с Python-сервера" });
+    // Network errors (ECONNREFUSED, timeout) — это WARN, не ERROR
+    const isNetworkError = (e as Error).message?.includes("fetch") ||
+                          (e as Error).message?.includes("ECONNREFUSED") ||
+                          (e as Error).message?.includes("ETIMEDOUT") ||
+                          (e as Error).name === "AbortError";
+    
+    if (isNetworkError) {
+      logWarn((e as Error).message, { context: "Получение эмбеддинга с Python-сервера (network)" });
+    } else {
+      logError(e as Error, { context: "Получение эмбеддинга с Python-сервера" });
+    }
     return { descriptor: null, quality: null, issues: [], passed: false, error: (e as Error).message };
   }
 }
@@ -681,6 +844,10 @@ async function detectFacesFromServer(
       if (response.status === 400) {
         logDebug(`Детекция: кадр пустой или невалиден (400), пропуск`);
         return [];
+      }
+      // 5xx — реальная ошибка сервера
+      if (response.status >= 500) {
+        logError(new Error(`Server responded with status: ${response.status}`), { context: "Детекция с Python-сервера" });
       }
       throw new Error(`Server responded with status: ${response.status}`);
     }
@@ -777,6 +944,9 @@ async function recognizeDescriptorOnServer(
 }
 
 async function syncIndexWithPython(): Promise<void> {
+  if (faissSyncStatus === 'SYNCING') return;
+
+  faissSyncStatus = 'SYNCING';
   try {
     const persons = storedDescriptors.map((d) => ({
       person_id: d.personId,
@@ -793,14 +963,36 @@ async function syncIndexWithPython(): Promise<void> {
     });
 
     if (!response.ok) {
-      logWarn(`Python index sync failed: ${response.status}`);
-    } else {
-      const result = await response.json() as { indexed?: number };
-      logDebug(`FAISS index synced with Python: ${result.indexed ?? "?"} vectors`);
+      throw new Error(`FAISS sync failed: ${response.status}`);
     }
+
+    const result = await response.json() as { indexed?: number };
+    logDebug(`FAISS index synced with Python: ${result.indexed ?? "?"} vectors`);
+    faissSyncStatus = 'SYNCED';
+    faissSyncRetryCount = 0;
   } catch (e) {
     logError(e as Error, { context: "Синхронизация индекса с Python" });
+    faissSyncStatus = 'DIRTY';
+    scheduleFaissSyncRetry();
   }
+}
+
+function scheduleFaissSyncRetry() {
+  if (faissSyncRetryTimer) clearTimeout(faissSyncRetryTimer);
+  if (faissSyncRetryCount >= FAISS_SYNC_MAX_RETRIES) {
+    logWarn(`FAISS sync max retries (${FAISS_SYNC_MAX_RETRIES}) reached. Manual intervention may be required.`);
+    return;
+  }
+  faissSyncRetryCount++;
+  const delay = FAISS_SYNC_BASE_DELAY_MS * Math.pow(2, faissSyncRetryCount - 1);
+  logWarn(`FAISS sync scheduled retry #${faissSyncRetryCount} in ${delay}ms`);
+  faissSyncRetryTimer = setTimeout(async () => {
+    await syncIndexWithPython();
+  }, delay);
+}
+
+export function getFaissSyncStatus(): { status: string; retryCount: number } {
+  return { status: faissSyncStatus, retryCount: faissSyncRetryCount };
 }
 
 // ─── ОСНОВНЫЕ ФУНКЦИИ ────────────────────────────────────────────────────────
@@ -973,14 +1165,40 @@ export async function registerPerson(
       storedDescriptors.splice(existingIdx, 1);
     }
 
+    // Smart Replacement: если достигнут лимит — удаляем самый старый дескриптор этой персоны
+    const currentCount = storedDescriptors.filter(d => d.personId === personId).length;
+    if (currentCount >= MAX_EMBEDDINGS_PER_PERSON) {
+      const oldestEntry = storedDescriptors
+        .filter(d => d.personId === personId)
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (oldestEntry) {
+        const removeIdx = storedDescriptors.indexOf(oldestEntry);
+        if (removeIdx >= 0) {
+          storedDescriptors.splice(removeIdx, 1);
+          try {
+            await prisma.faceDescriptor.deleteMany({
+              where: {
+                person_id: personId,
+                photo_path: oldestEntry.photoPath,
+              },
+            });
+          } catch (e) {
+            logWarn("Не удалось удалить старый дескриптор из БД при Smart Replacement", { error: (e as Error).message });
+          }
+          logDebug(`[SmartReplacement] Удалён старый дескриптор (${new Date(oldestEntry.createdAt).toISOString()}) для "${personName}" (ID: ${personId})`);
+        }
+      }
+    }
+
     // Добавляем новый дескриптор
     storedDescriptors.push({
       personId,
       personName,
       category,
       photoPath,
-      descriptor,
+      descriptor: descriptor,
       descriptorList: Array.from(descriptor),
+      createdAt: Date.now(),
     });
 
     // Сохраняем в БД (бинарный формат с fallback на JSON)
@@ -1019,6 +1237,22 @@ export async function registerPersonFromDescriptor(
       storedDescriptors.splice(existingIdx, 1);
     }
 
+    // Smart Replacement: если достигнут лимит — удаляем самый старый дескриптор этой персоны
+    const currentCount = storedDescriptors.filter(d => d.personId === personId).length;
+    if (currentCount >= MAX_EMBEDDINGS_PER_PERSON) {
+      const oldestIdx = storedDescriptors
+        .filter(d => d.personId === personId)
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (oldestIdx) {
+        const removeIdx = storedDescriptors.indexOf(oldestIdx);
+        if (removeIdx >= 0) {
+          const removed = storedDescriptors[removeIdx];
+          storedDescriptors.splice(removeIdx, 1);
+          logDebug(`[SmartReplacement] Удалён старый дескриптор (${new Date(removed.createdAt).toISOString()}) для "${personName}" (ID: ${personId})`);
+        }
+      }
+    }
+
     // Добавляем новый дескриптор
     storedDescriptors.push({
       personId,
@@ -1027,6 +1261,7 @@ export async function registerPersonFromDescriptor(
       photoPath,
       descriptor: desc,
       descriptorList: Array.from(desc),
+      createdAt: Date.now(),
     });
 
     // Сохраняем в БД (бинарный формат с fallback на JSON)
@@ -1081,6 +1316,57 @@ export async function addEmbeddingToPerson(
     );
     if (existingIdx >= 0) storedDescriptors.splice(existingIdx, 1);
 
+    // Smart Replacement: если достигнут лимит — удаляем самый старый дескриптор этой персоны
+    const currentCount = storedDescriptors.filter(d => d.personId === personId).length;
+    if (currentCount >= MAX_EMBEDDINGS_PER_PERSON) {
+      const oldestEntry = storedDescriptors
+        .filter(d => d.personId === personId)
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (oldestEntry) {
+        const removeIdx = storedDescriptors.indexOf(oldestEntry);
+        if (removeIdx >= 0) {
+          storedDescriptors.splice(removeIdx, 1);
+          try {
+            await prisma.faceDescriptor.deleteMany({
+              where: {
+                person_id: personId,
+                photo_path: oldestEntry.photoPath,
+              },
+            });
+          } catch (e) {
+            logWarn("Не удалось удалить старый дескриптор из БД при Smart Replacement (registerPerson)", { error: (e as Error).message });
+          }
+          logDebug(`[SmartReplacement] Удалён старый дескриптор для "${personName}" (ID: ${personId}) при первичной регистрации`);
+        }
+      }
+    }
+
+    // Добавляем новый дескриптор
+    // Smart Replacement: если достигнут лимит — удаляем самый старый дескриптор этой персоны
+    const currentCountAdd = storedDescriptors.filter(d => d.personId === personId).length;
+    if (currentCountAdd >= MAX_EMBEDDINGS_PER_PERSON) {
+      const oldestEntryAdd = storedDescriptors
+        .filter(d => d.personId === personId)
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (oldestEntryAdd) {
+        const removeIdxAdd = storedDescriptors.indexOf(oldestEntryAdd);
+        if (removeIdxAdd >= 0) {
+          storedDescriptors.splice(removeIdxAdd, 1);
+          try {
+            await prisma.faceDescriptor.deleteMany({
+              where: {
+                person_id: personId,
+                photo_path: oldestEntryAdd.photoPath,
+              },
+            });
+          } catch (e) {
+            logWarn("Не удалось удалить старый дескриптор из БД при Smart Replacement (addEmbedding)", { error: (e as Error).message });
+          }
+          logDebug(`[SmartReplacement] Удалён старый дескриптор для "${personName}" (ID: ${personId}) при добавлении доп. эмбеддинга`);
+        }
+      }
+    }
+
     storedDescriptors.push({
       personId,
       personName,
@@ -1088,6 +1374,7 @@ export async function addEmbeddingToPerson(
       photoPath,
       descriptor: desc,
       descriptorList: Array.from(desc),
+      createdAt: Date.now(),
     });
 
     const saved = await saveDescriptorToDB(personId, personName, category, photoPath, desc);
@@ -1130,6 +1417,36 @@ export async function unregisterPerson(personId: number): Promise<void> {
   logDebug(`Удалено ${before - storedDescriptors.length} дескрипторов персоны ID: ${personId}`);
 
   await syncIndexWithPython();
+}
+
+/**
+ * Удаляет дескриптор(ы), связанные с конкретным фото.
+ * Используется при удалении фото персоны, чтобы не оставлять "мёртвых" эмбеддингов в FAISS.
+ */
+export async function removeDescriptorsByPhotoPath(
+  personId: number,
+  photoPath: string
+): Promise<number> {
+  const before = storedDescriptors.length;
+  let i = storedDescriptors.length;
+  while (i--) {
+    if (storedDescriptors[i].personId === personId && storedDescriptors[i].photoPath === photoPath) {
+      storedDescriptors.splice(i, 1);
+    }
+  }
+  const removed = before - storedDescriptors.length;
+  if (removed > 0) {
+    try {
+      await prisma.faceDescriptor.deleteMany({
+        where: { person_id: personId, photo_path: photoPath },
+      });
+    } catch (err) {
+      logError(err as Error, { context: "Удаление дескриптора фото из БД", personId, photoPath });
+    }
+    logDebug(`Удалено ${removed} дескрипторов для фото ${photoPath} персоны ID: ${personId}`);
+    await syncIndexWithPython();
+  }
+  return removed;
 }
 
 /**
@@ -1354,4 +1671,75 @@ export function clearEmbeddingCache(): void {
 export async function forceHealthCheck(): Promise<boolean> {
   pythonServerLastCheck = 0; // сбрасываем таймер
   return await checkPythonServerHealth();
+}
+
+// ── v2: детекция с distance (Python /detect-with-distance) ──
+export interface DetectedFaceWithDistance extends DetectedFace {
+  distance_m?: number | null;
+  depth_mode?: string;
+  in_zone?: boolean;
+  track_id?: number;
+  dwell_time_sec?: number;
+  is_stopped?: boolean;
+}
+
+export async function detectFacesWithDistance(
+  imgBuffer: Buffer,
+  cam: any
+): Promise<DetectedFaceWithDistance[]> {
+  try {
+    const formData = new FormData();
+    const uint8Array = new Uint8Array(imgBuffer);
+    const blob = new Blob([uint8Array], { type: "image/jpeg" });
+    formData.append("image", blob as any, "image.jpg");
+    formData.append("with_descriptors", "true");
+
+    // Отправляем параметры камеры для distance-расчётов (всегда, для graceful degradation)
+    if (cam.distance_calib_mode) formData.append("distance_calib_mode", cam.distance_calib_mode);
+    if (cam.roi_zones) formData.append("roi_polygon", cam.roi_zones);
+    formData.append("distance_min_m", String(cam.distance_min_m ?? 2.0));
+    formData.append("distance_max_m", String(cam.distance_max_m ?? 4.0));
+    formData.append("distance_ignore_m", String(cam.distance_ignore_m ?? 1.5));
+    // focal_length_px — всегда, даже если 0/не задан: pinhole fallback = graceful degradation
+    formData.append("focal_length_px", String(cam.focal_length_px ?? 1400));
+
+    const response = await apiFetchWithKey(`${FACE_SERVER_URL}/detect-with-distance`, {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      if (response.status === 400) {
+        logDebug(`Детекция с distance: кадр пустой (400), пропуск`);
+        return [];
+      }
+      if (response.status >= 500) {
+        logError(new Error(`Server responded with status: ${response.status}`), { context: "Детекция с distance" });
+      }
+      throw new Error(`Server responded with status: ${response.status}`);
+    }
+
+    const result = await response.json() as {
+      faces: Array<{
+        box: any;
+        score: number;
+        descriptor?: number[];
+        distance_m?: number | null;
+        depth_mode?: string;
+        in_zone?: boolean;
+      }>;
+    };
+
+    return result.faces.map((f: any) => ({
+      box: f.box,
+      score: f.score,
+      descriptor: f.descriptor ? new Float32Array(f.descriptor) : undefined,
+      distance_m: f.distance_m ?? null,
+      depth_mode: f.depth_mode,
+      in_zone: f.in_zone,
+    }));
+  } catch (e) {
+    logError(e as Error, { context: "Детекция с distance" });
+    return [];
+  }
 }

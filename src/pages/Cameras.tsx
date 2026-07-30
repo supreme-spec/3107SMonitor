@@ -8,6 +8,8 @@ import ConfirmModal, { AlertModal } from '../components/ConfirmModal'
 interface FoundUsb { index: number; source: string; name: string }
 interface FoundIp { ip: string; port: number; source: string; rtsp_base?: string; common_paths?: string[]; type: string }
 
+const UNV_RTSP_EXAMPLE = "rtsp://admin:password@192.168.10.197:554/Streaming/Channels/101?tcp_transport=tcp";
+
 export default function Cameras() {
   const [cameras, setCameras] = useState<Camera[]>([])
   const [loading, setLoading] = useState(true)
@@ -288,6 +290,15 @@ export default function Cameras() {
                   {cam.roi_zones.length} {cam.roi_zones.length === 1 ? 'зона' : cam.roi_zones.length < 5 ? 'зоны' : 'зон'}
                 </span>
               )}
+              {cam.exclusion_zones && cam.exclusion_zones.length > 0 && (
+                <span
+                  className="bg-red-500/20 text-red-400 px-2 py-0.5 rounded cursor-pointer hover:bg-red-500/30 transition-colors"
+                  onClick={() => setRoiCamera(cam)}
+                  title="Маски (исключить зоны)"
+                >
+                  {cam.exclusion_zones.length} {cam.exclusion_zones.length === 1 ? 'маска' : cam.exclusion_zones.length < 5 ? 'маски' : 'масок'}
+                </span>
+              )}
             </div>
 
             {/* Action buttons */}
@@ -416,14 +427,18 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
   const [username, setUsername] = useState(camera.username ?? '')
   const [password, setPassword] = useState(camera.password ?? '')
   const [useAnalytics, setUseAnalytics] = useState(camera.use_camera_analytics ?? false)
+  const [detectionThreshold, setDetectionThreshold] = useState<number>(camera.detection_threshold ?? 0.8)
+  const [minFaceSize, setMinFaceSize] = useState<number>(camera.min_face_size ?? 80)
+  const [maxFaceSize, setMaxFaceSize] = useState<number>(camera.max_face_size ?? 0)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
+  const isSubstream = /\/102\b|Channels\/102/.test(source || '')
+
   const handleSave = async () => {
     if (!name.trim()) { setError('Название обязательно'); return }
-    if (!source.trim()) { setError('Источник обязателен'); return }
     setSaving(true)
     setError('')
     try {
@@ -440,8 +455,11 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
           username: username.trim() || null,
           password: password || null,
           use_camera_analytics: useAnalytics,
+          detection_threshold: detectionThreshold,
+          min_face_size: minFaceSize,
+          max_face_size: maxFaceSize || null,
         }),
-      })
+      });
       onSaved()
     } catch (e: any) {
       setError(e.message || 'Ошибка сохранения')
@@ -506,7 +524,7 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
                 rows={3}
                 spellCheck={false}
                 className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-sm px-3 py-2 rounded-lg focus:outline-none focus:border-kraken-purple font-mono resize-none leading-relaxed"
-                placeholder="rtsp://admin:password@192.168.1.100:554/stream"
+                placeholder={UNV_RTSP_EXAMPLE}
               />
             ) : (
               <input
@@ -516,6 +534,12 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
                 className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-sm px-3 py-2 rounded-lg focus:outline-none focus:border-kraken-purple font-mono"
                 placeholder="0"
               />
+            )}
+            {isSubstream && (
+              <div className="mt-2 rounded-lg border border-yellow-500/50 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300">
+                ⚠️ Обнаружен субпоток /102. Для распознавания лиц используйте основной поток <strong>/101</strong> (1080p).
+                Субпоток 720p может снизить точность и привести к пропускам.
+              </div>
             )}
             {/* Full path display for reference */}
             {source && (
@@ -618,6 +642,33 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
             </label>
           </div>
 
+          <div className="border border-kraken-border rounded-xl p-3 space-y-3">
+            <div className="text-kraken-muted text-xs uppercase tracking-widest">Детекция лиц</div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-kraken-muted text-[10px] mb-0.5 block">Порог уверенности</label>
+                <input type="number" step="0.01" min="0.1" max="1" value={detectionThreshold} onChange={e => setDetectionThreshold(parseFloat(e.target.value))}
+                  className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple font-mono" />
+              </div>
+              <div>
+                <label className="text-kraken-muted text-[10px] mb-0.5 block">Мин. размер лица (px)</label>
+                <input type="number" step="1" min="20" max="500" value={minFaceSize} onChange={e => setMinFaceSize(parseInt(e.target.value) || 0)}
+                  className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple font-mono" />
+              </div>
+              <div>
+                <label className="text-kraken-muted text-[10px] mb-0.5 block">Макс. размер лица (px)</label>
+                <input type="number" step="1" min="0" max="800" value={maxFaceSize} onChange={e => setMaxFaceSize(parseInt(e.target.value) || 0)}
+                  className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple font-mono" />
+              </div>
+              <div className="flex items-end">
+                <button onClick={() => { setDetectionThreshold(0.8); setMinFaceSize(80); setMaxFaceSize(0) }}
+                  className="text-xs px-2 py-1 rounded-lg bg-kraken-purple/10 text-kraken-purple hover:bg-kraken-purple/20 transition-colors w-full">
+                  Сброс детекции
+                </button>
+              </div>
+            </div>
+          </div>
+
           {error && (
             <div className="text-kraken-red text-sm bg-kraken-red/10 px-3 py-2 rounded-lg">
               {error}
@@ -659,8 +710,13 @@ function AddCameraModal({ onClose, onSaved, usbFound, initialSource = '', initia
   const [username, setUsername] = useState('admin')
   const [password, setPassword] = useState('')
   const [useAnalytics, setUseAnalytics] = useState(false)
+  const [detectionThreshold, setDetectionThreshold] = useState<number>(0.8)
+  const [minFaceSize, setMinFaceSize] = useState<number>(80)
+  const [maxFaceSize, setMaxFaceSize] = useState<number>(0)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+
+  const isSubstream = /\/102\b|Channels\/102/.test(source || '')
 
   const validateSource = () => {
     if (!source.trim()) return 'Источник обязателен'
@@ -699,8 +755,11 @@ function AddCameraModal({ onClose, onSaved, usbFound, initialSource = '', initia
           username: username.trim() || null,
           password: password || null,
           use_camera_analytics: useAnalytics,
+          detection_threshold: detectionThreshold,
+          min_face_size: minFaceSize,
+          max_face_size: maxFaceSize || null,
         }),
-      })
+      });
       onSaved()
     } catch (e: any) {
       setError(e.message)
@@ -767,16 +826,25 @@ function AddCameraModal({ onClose, onSaved, usbFound, initialSource = '', initia
                 type="text"
                 value={source}
                 onChange={e => setSource(e.target.value)}
-                placeholder={type === 'USB' ? '0' : 'rtsp://admin:password@192.168.1.100:554/stream'}
+                placeholder={type === 'USB' ? '0' : UNV_RTSP_EXAMPLE}
                 className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-sm px-3 py-2 rounded-lg focus:outline-none focus:border-kraken-purple font-mono"
               />
+            )}
+            {isSubstream && (
+              <div className="mt-2 rounded-lg border border-yellow-500/50 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300">
+                ⚠️ Обнаружен субпоток /102. Для распознавания лиц используйте основной поток <strong>/101</strong> (1080p).
+                Субпоток 720p может снизить точность и привести к пропускам.
+              </div>
             )}
             {(type === 'RTSP' || type === 'IP') && (
               <div className="mt-1.5 text-kraken-disabled text-xs space-y-0.5">
                 <div>Примеры RTSP путей:</div>
-                <div className="font-mono">rtsp://admin:pass@192.168.1.100:554/stream</div>
-                <div className="font-mono">rtsp://192.168.1.100:554/Streaming/Channels/101 (Hikvision)</div>
+                <div className="font-mono">rtsp://admin:pass@192.168.10.197:554/Streaming/Channels/101?tcp_transport=tcp (UNV)</div>
+                <div className="font-mono">rtsp://admin:pass@192.168.1.100:554/stream/101 (Hikvision)</div>
                 <div className="font-mono">rtsp://192.168.1.100:554/cam/realmonitor?channel=1 (Dahua)</div>
+                <div className="text-kraken-purple/80">
+                  💡 Для Uniview используйте <strong>/101</strong> (основной поток 1080p). Поток <strong>/102</strong> (720p) снижает точность распознавания.
+                </div>
               </div>
             )}
           </div>
@@ -833,9 +901,36 @@ function AddCameraModal({ onClose, onSaved, usbFound, initialSource = '', initia
                 </label>
               )}
             </div>
-          )}
+           )}
 
-          <div className="flex gap-4 p-3 bg-kraken-base rounded-xl border border-kraken-border">
+           <div className="border border-kraken-border rounded-xl p-3 space-y-3">
+             <div className="text-kraken-muted text-xs uppercase tracking-widest">Детекция лиц</div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-kraken-muted text-[10px] mb-0.5 block">Порог уверенности</label>
+                  <input type="number" step="0.01" min="0.1" max="1" value={detectionThreshold} onChange={e => setDetectionThreshold(parseFloat(e.target.value))}
+                    className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple font-mono" />
+                </div>
+                <div>
+                  <label className="text-kraken-muted text-[10px] mb-0.5 block">Мин. размер лица (px)</label>
+                  <input type="number" step="1" min="20" max="500" value={minFaceSize} onChange={e => setMinFaceSize(parseInt(e.target.value) || 0)}
+                    className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple font-mono" />
+                  </div>
+                <div>
+                  <label className="text-kraken-muted text-[10px] mb-0.5 block">Макс. размер лица (px)</label>
+                  <input type="number" step="1" min="0" max="800" value={maxFaceSize} onChange={e => setMaxFaceSize(parseInt(e.target.value) || 0)}
+                    className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple font-mono" />
+                </div>
+                <div className="flex items-end">
+                  <button onClick={() => { setDetectionThreshold(0.8); setMinFaceSize(80); setMaxFaceSize(0) }}
+                    className="text-xs px-2 py-1 rounded-lg bg-kraken-purple/10 text-kraken-purple hover:bg-kraken-purple/20 transition-colors w-full">
+                    Сброс детекции
+                  </button>
+                </div>
+              </div>
+           </div>
+
+           <div className="flex gap-4 p-3 bg-kraken-base rounded-xl border border-kraken-border">
             <label className="flex-1 flex items-center gap-2 cursor-pointer group">
               <input
                 type="checkbox"

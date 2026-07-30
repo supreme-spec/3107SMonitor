@@ -18,7 +18,11 @@ model Camera {
   is_active            Boolean   @default(true)
   created_at           DateTime  @default(now())
   status               String    @default("offline")
-  roi_zones            String?   // JSON string
+  roi_zones            String?   // JSON: detection zones
+  exclusion_zones      String?   // JSON: masks/zones to ignore
+  detection_threshold  Float?    // per-camera override, 0..1
+  min_face_size        Int?      // per-camera override, px
+  max_face_size        Int?      // per-camera override, px (anti-"in-your-face")
   fps                  Int       @default(25)
   ping_ms              Int       @default(0)
   is_smart_recording   Boolean   @default(false)
@@ -29,9 +33,62 @@ model Camera {
   username             String?
   password             String?
   use_camera_analytics Boolean   @default(false)
-  
+  faiss_sync_status    String?   @default("SYNCED") // SYNCED | DIRTY | SYNCING
+  faiss_dirty_at       DateTime?
+
+  passage_roi_x_min    Float?    @default(0.3)
+  passage_roi_x_max    Float?    @default(0.65)
+  passage_roi_y_min    Float?    @default(0.1)
+  passage_roi_y_max    Float?    @default(0.8)
+  guard_ignore_x_max   Float?    @default(0.3)
+
+  // ── v2: профилирование потока (ffprobe, read-only) ──
+  detected_width        Int?
+  detected_height       Int?
+  detected_fps          Float?
+  detected_codec        String?
+  detected_bitrate_kbps Int?
+  detected_gop          Int?
+  detected_at           DateTime?
+  profile_version       Int       @default(1)
+  profile_needs_refresh Boolean   @default(false)
+  // ── v2: override потока (Advanced) ──
+  override_width        Int?
+  override_height       Int?
+  override_fps          Float?
+  // ── v2: два потока ──
+  stream_main_url       String?
+  stream_sub_url        String?
+  use_substream_tracking Boolean  @default(true)
+  // ── v2: декод (на камере только аварийный override) ──
+  force_decode_strategy String?
+  detection_max_width   Int       @default(960)
+  // ── v2: ROI полигон ──
+  roi_polygon           String?
+  // ── v2: калибровка расстояния лесенкой ──
+  distance_calib_mode   String?
+  person_calib_pts_px   String?
+  person_calib_depth_m  String?
+  floor_calib_pts_px    String?
+  floor_calib_pts_m     String?
+  floor_homography      String?
+  // ── v2: рекомендации + сырьё для score ──
+  stream_recommendation String?
+  ai_proxy_stats        String?
+  feedback_counts       String?
+
   events               Event[]
   recordings           Recording[]
+}
+
+model SystemConfig {
+  id                     String   @id @default("default")
+  server_decode_strategy String   @default("auto")
+  server_has_gpu         Boolean  @default(false)
+  server_hw_min_cameras  Int      @default(4)
+  server_hw_min_pixels   Int      @default(8294400)
+  health_rules_version   String   @default("v3")
+  updated_at             DateTime @updatedAt
 }
 
 model Category {
@@ -194,4 +251,89 @@ model FaissUpdateLog {
   action      String
   details     String?
   status      String
+}
+
+// ── Sprint 6.5: Multi Operator Verification System ───────────────────────────
+
+model Operator {
+  id           Int                @id @default(autoincrement())
+  name         String
+  email        String             @unique
+  roles        String             @default("reviewer") // reviewer, admin
+  created_at   DateTime           @default(now())
+  decisions    OperatorDecision[]
+}
+
+model RecognitionCase {
+  id                       Int                @id @default(autoincrement())
+  original_photo_path      String
+  ai_candidate_person_id   Int?
+  ai_confidence            Float
+  status                   String             @default("OPEN") // OPEN, WAITING_OPERATORS, PARTIAL_RESULT, CONFIRMED, REJECTED, NEEDS_REVIEW
+  confirm_count            Int                @default(0)
+  reject_match_count       Int                @default(0)
+  ai_error_count           Int                @default(0)
+  review_count             Int                @default(0)
+  created_at               DateTime           @default(now())
+  resolved_at              DateTime?
+  decisions                OperatorDecision[]
+  source_event_id          Int?               @unique
+}
+
+model OperatorDecision {
+  id             Int              @id @default(autoincrement())
+  case_id        Int
+  operator_id    Int
+  decision       String           // CONFIRM, REJECT_MATCH, AI_ERROR, NEEDS_REVIEW
+  screen_path    String?
+  comment        String?
+  timestamp      DateTime         @default(now())
+  
+  case           RecognitionCase  @relation(fields: [case_id], references: [id])
+  operator       Operator         @relation(fields: [operator_id], references: [id])
+  
+  @@index([case_id])
+  @@index([operator_id])
+  @@index([decision])
+}
+
+// ── Sprint 6.5: Reliable Archive Builder ─────────────────────────────────────
+
+model ImportSession {
+  id                       Int             @id @default(autoincrement())
+  start_time               DateTime        @default(now())
+  operator                 String?
+  workspace                String
+  total_files              Int             @default(0)
+  completed                Int             @default(0)
+  rejected                 Int             @default(0)
+  errors                   Int             @default(0)
+  status                   String          @default("RUNNING") // RUNNING, PAUSED, COMPLETED, FAILED
+  last_checkpoint_at       DateTime?
+  last_checkpoint_progress Int             @default(0)
+  tasks                    ArchiveTask[]
+  ended_at                 DateTime?
+}
+
+model ArchiveTask {
+  id                    Int       @id @default(autoincrement())
+  photo_hash            String    // SHA-256
+  photo_path            String
+  status                String    @default("NEW") // NEW, LOADED, FACE_DETECTED, EMBEDDING_CREATED, THUMBNAIL_CREATED, DATABASE_SAVED, FAISS_INDEXED, COMPLETED
+  embedding_status      String    @default("PENDING") // PENDING, OK, FAILED
+  thumbnail_status      String    @default("PENDING")
+  database_status       String    @default("PENDING")
+  faiss_status          String    @default("PENDING")
+  embedding_error       String?
+  thumbnail_error       String?
+  database_error        String?
+  faiss_error           String?
+  created_at            DateTime  @default(now())
+  updated_at            DateTime  @updatedAt
+  import_session_id     Int
+  import_session        ImportSession @relation(fields: [import_session_id], references: [id])
+  
+  @@index([photo_hash])
+  @@index([status])
+  @@index([import_session_id])
 }

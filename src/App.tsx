@@ -60,9 +60,13 @@ export default function App() {
   const currentConfirmation = confirmationQueue[0] ?? null
   const [latestFace, setLatestFace] = useState<FaceDetection | null>(null)
   const [showProjection, setShowProjection] = useState(false)
-  const [notifyEnabled, setNotifyEnabled] = useState(() =>
-    localStorage.getItem('kraken_notify') !== 'false'
-  )
+  const [notifyEnabled, setNotifyEnabled] = useState(() => {
+    try {
+      return localStorage.getItem('kraken_notify') !== 'false'
+    } catch {
+      return true
+    }
+  })
   const [enabledCategories, setEnabledCategories] = useState<Set<string>>(() => {
     try {
       const raw = localStorage.getItem('kraken_notify_cats')
@@ -106,8 +110,8 @@ export default function App() {
 
   // Load recent events — обновляем при старте и при получении алерта
   const fetchRecentEvents = useCallback(() => {
-    apiFetch<KrakenEvent[]>('/events?limit=50')
-      .then(setRecentEvents)
+    apiFetch<{ events: KrakenEvent[]; next_cursor: number | null }>('/events?limit=50')
+      .then(data => setRecentEvents(data.events))
       .catch(err => {
         console.debug('Failed to load events:', err)
       })
@@ -215,6 +219,7 @@ export default function App() {
   }, [])
 
   const renderPage = () => {
+    console.log('[App] renderPage', page)
     switch (page) {
       case 'live':
         return (

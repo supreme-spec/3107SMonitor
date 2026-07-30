@@ -174,6 +174,7 @@ export default function LiveMonitor({
   cameras, selectedCameraId, onSelectCamera,
   recentEvents, onLatestFace, onNavigateEvents, onNavigatePeople,
 }: Props) {
+  console.log('[LiveMonitor] render', { cameras: cameras.length, selectedCameraId, recentEvents: recentEvents.length })
   const containerRef = useRef<HTMLDivElement>(null)
   const [containerSize, setContainerSize] = useState({ w: 1200, h: 700 })
   const [layout, setLayout] = useState<Layout>(() => defaultLayout(1200, 700))
@@ -196,6 +197,7 @@ export default function LiveMonitor({
     message: string;
   } | null>(null)
   const selectedCamera = cameras.find(c => c.id === selectedCameraId) ?? null
+  console.log('[LiveMonitor] selectedCamera', selectedCamera)
 
   // Templates state
   const [templates, setTemplates] = useState<LayoutTemplate[]>(() => loadTemplates())
@@ -247,16 +249,16 @@ export default function LiveMonitor({
     setTimeout(() => setCaptureMsg(''), 3000)
   }, [selectedCameraId])
 
-  // ── W/Ц: нажали — начать запись, отпустили — остановить ─────────────────────
+  // ── Ctrl+W: нажали — начать умную запись, отпустили — остановить ───────────
   useEffect(() => {
     const handleKeyDown = async (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
       if (e.repeat) return // не реагировать на автоповтор клавиши
 
       const key = e.key.toLowerCase()
-      const isRecordKey = key === 'w' || key === 'ц' || e.code === 'KeyW'
+      const isSmartRecordKey = e.ctrlKey && (key === 'w' || key === 'ц' || e.code === 'KeyW')
       const isCaptureKey = key === 's' || key === 'ы' || e.code === 'KeyS'
-      if (isRecordKey) {
+      if (isSmartRecordKey) {
         if (!selectedCameraId || isRecording) return
         e.preventDefault()
         try {
@@ -266,9 +268,9 @@ export default function LiveMonitor({
             headers: token ? { Authorization: `Bearer ${token}` } : {},
           })
           setIsRecording(true)
-          setRecordingMsg('🔴 Запись...')
+          setRecordingMsg('🔴 Умная запись...')
         } catch (e) {
-          console.error('Recording start error:', e)
+          console.error('Smart recording start error:', e)
           setRecordingMsg('❌ Ошибка записи')
         }
       }
@@ -284,8 +286,8 @@ export default function LiveMonitor({
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
 
       const key = e.key.toLowerCase()
-      const isRecordKey = key === 'w' || key === 'ц' || e.code === 'KeyW'
-      if (isRecordKey) {
+      const isSmartRecordKey = e.ctrlKey && (key === 'w' || key === 'ц' || e.code === 'KeyW')
+      if (isSmartRecordKey) {
         if (!selectedCameraId || !isRecording) return
         e.preventDefault()
         try {
@@ -372,8 +374,10 @@ export default function LiveMonitor({
   useEffect(() => { onLatestFaceRef.current = onLatestFace }, [onLatestFace])
   const [detectedFace, setDetectedFace] = useState<FaceDetection | null>(null)
   const [detectedPerson, setDetectedPerson] = useState<Person | null>(null)
+  const [lastFaceTimestamp, setLastFaceTimestamp] = useState<number>(Date.now())
 
   const handleFaceDetected = useCallback((face: FaceDetection) => {
+    setLastFaceTimestamp(Date.now())
     if (face.track_id === -1) {
       onLatestFaceRef.current?.(null)
       setDetectedFace(null); setDetectedPerson(null)
@@ -396,20 +400,42 @@ export default function LiveMonitor({
   // People
   const [people, setPeople] = useState<Person[]>([])
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [loadingPeople, setLoadingPeople] = useState(false)
   const [showAddModal, setShowAddModal] = useState(false)
+  const [guestInitialPhotos, setGuestInitialPhotos] = useState<File[]>([])
   const [editPerson, setEditPerson] = useState<Person | null>(null)
+  const [showPeopleDrawer, setShowPeopleDrawer] = useState(false)
+  const [addError, setAddError] = useState('')
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search), 300)
+    return () => clearTimeout(t)
+  }, [search])
+
+  useEffect(() => {
+    try {
+      const saved = sessionStorage.getItem('kraken_people_drawer_open')
+      if (saved === 'true') setShowPeopleDrawer(true)
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem('kraken_people_drawer_open', String(showPeopleDrawer))
+    } catch {}
+  }, [showPeopleDrawer])
 
   const fetchPeople = useCallback(async () => {
     setLoadingPeople(true)
     try {
       const params = new URLSearchParams()
-      if (search) params.set('search', search)
+      if (debouncedSearch) params.set('search', debouncedSearch)
       const data = await apiFetch<Person[]>(`/persons/?${params}`)
       setPeople(data)
     } catch {}
     finally { setLoadingPeople(false) }
-  }, [search])
+  }, [debouncedSearch])
 
   useEffect(() => { fetchPeople() }, [fetchPeople])
 
@@ -429,6 +455,24 @@ export default function LiveMonitor({
         }
       }
     })
+  }
+
+  const handleQuickAddGuest = async () => {
+    if (!selectedCameraId) return
+    setAddError('')
+    try {
+      const snap = await apiFetch<{ image: string; content_type: string }>(
+        `/cameras/${selectedCameraId}/snapshot`
+      )
+      const byteStr = atob(snap.image)
+      const arr = new Uint8Array(byteStr.length)
+      for (let i = 0; i < byteStr.length; i++) arr[i] = byteStr.charCodeAt(i)
+      const file = new File([arr], `guest_${Date.now()}.jpg`, { type: 'image/jpeg' })
+      setGuestInitialPhotos([file])
+      setShowAddModal(true)
+    } catch (e: any) {
+      setAddError(e?.message || 'Не удалось получить снимок')
+    }
   }
 
   const handleAddPhotoFromCamera = async (personId: number, cameraId: number) => {
@@ -465,6 +509,8 @@ export default function LiveMonitor({
     people: 'База людей', events: 'Последние события',
     guest: 'Последний гость',
   }
+
+  console.log('[LiveMonitor] about to render JSX', { layout })
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
@@ -672,95 +718,31 @@ export default function LiveMonitor({
           </DraggableBlock>
         )}
 
-        {/* База людей */}
+        {/* База людей — компактный вид */}
         {layout.people.visible && (
           <DraggableBlock id="people" state={layout.people} containerRef={containerRef}
-            onRectChange={updateRect} onFocus={bringToFront} title="База людей"
-            headerExtra={
-              <>
-                <div className="relative flex-1 max-w-[180px]">
-                  <Search size={11} className="absolute left-2 top-1/2 -translate-y-1/2 text-kraken-muted" />
+            onRectChange={updateRect} onFocus={bringToFront} title="База людей">
+            <div className="h-full flex flex-col items-center justify-center gap-3 p-4">
+              <div className="text-center">
+                <div className="text-3xl font-black text-kraken-text">{people.length}</div>
+                <div className="text-kraken-muted text-[10px] uppercase tracking-widest mt-1">персон в базе</div>
+              </div>
+              <div className="flex items-center gap-2 w-full">
+                <div className="relative flex-1">
+                  <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-kraken-muted" />
                   <input type="text" placeholder="Поиск..." value={search}
                     onChange={e => setSearch(e.target.value)}
-                    className="w-full bg-kraken-base border border-kraken-border text-kraken-text text-xs pl-6 pr-2 py-1 rounded-lg focus:outline-none focus:border-kraken-purple" />
+                    className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs pl-6 pr-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple" />
                 </div>
-                <button onClick={() => { setEditPerson(null); setShowAddModal(true) }}
-                  className="flex items-center gap-1 bg-kraken-purple hover:bg-kraken-purple-hover text-white text-xs px-2 py-1 rounded-lg font-semibold transition-colors flex-shrink-0">
-                  <Plus size={11} /> Добавить
+                <button onClick={() => setShowPeopleDrawer(true)}
+                  className="flex items-center gap-1 bg-kraken-purple hover:bg-kraken-purple-hover text-white text-xs px-3 py-1.5 rounded-lg font-semibold transition-colors flex-shrink-0">
+                  <FolderOpen size={12} /> Открыть
                 </button>
-              </>
-            }>
-            <div className="h-full flex flex-col overflow-hidden">
-              <div className="flex-1 overflow-y-auto">
-                <table className="w-full">
-                  <thead className="sticky top-0 bg-kraken-panel z-10">
-                    <tr className="text-kraken-disabled text-[10px] uppercase tracking-wider border-b border-kraken-border">
-                      <th className="px-3 py-1.5 text-left">Фото</th>
-                      <th className="px-3 py-1.5 text-left">Имя</th>
-                      <th className="px-3 py-1.5 text-left">Категория</th>
-                      <th className="px-3 py-1.5 text-left">Комментарий</th>
-                      <th className="px-3 py-1.5 text-right">Действия</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {loadingPeople && (
-                      <tr><td colSpan={5} className="text-center py-4 text-kraken-disabled text-xs">Загрузка...</td></tr>
-                    )}
-                    {!loadingPeople && people.length === 0 && (
-                      <tr><td colSpan={5} className="text-center py-6">
-                        <div className="text-kraken-disabled text-sm mb-1">База пуста</div>
-                        <button onClick={() => { setEditPerson(null); setShowAddModal(true) }}
-                          className="text-kraken-purple text-xs hover:underline">+ Добавить</button>
-                      </td></tr>
-                    )}
-                    {people.map(p => (
-                      <tr key={p.id} className="border-b border-kraken-border hover:bg-kraken-hover transition-colors">
-                        <td className="px-3 py-1.5">
-                          <div className="w-16 h-16 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border">
-                            {p.photo_path
-                              ? <img src={`${PHOTO_BASE}/${p.photo_path}`} alt="" className="w-full h-full object-cover" />
-                              : <div className="w-full h-full flex items-center justify-center text-lg">👤</div>}
-                          </div>
-                        </td>
-                        <td className="px-3 py-1.5 text-kraken-text text-sm font-medium">{p.name}</td>
-                        <td className="px-3 py-1.5"><CategoryBadge category={p.category} /></td>
-                        <td className="px-3 py-1.5 text-kraken-muted text-sm max-w-[120px] truncate">{p.comment ?? '—'}</td>
-                        <td className="px-3 py-1.5">
-                          <div className="flex items-center gap-1 justify-end">
-                            <button onClick={() => { setEditPerson(p); setShowAddModal(true) }}
-                              className="p-1 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-purple transition-colors"
-                              title="Редактировать">
-                              <Edit2 size={14} />
-                            </button>
-                            {selectedCameraId && (
-                              <button
-                                onClick={() => handleAddPhotoFromCamera(p.id, selectedCameraId)}
-                                className="p-1 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-green transition-colors"
-                                title="Обновить фото с текущей камеры"
-                              >
-                                <ImagePlus size={14} />
-                              </button>
-                            )}
-                            <button onClick={() => handleDelete(p.id)}
-                              className="p-1 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-red transition-colors"
-                              title="Удалить">
-                              <Trash2 size={14} />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
               </div>
-              <div className="px-3 py-1.5 border-t border-kraken-border flex items-center justify-between flex-shrink-0">
-                <span className="text-kraken-disabled text-[10px]">Всего: {people.length}</span>
-                {onNavigatePeople && (
-                  <button onClick={onNavigatePeople} className="text-kraken-purple text-[10px] hover:underline">
-                    Полная база →
-                  </button>
-                )}
-              </div>
+              <button onClick={() => { setEditPerson(null); setShowAddModal(true) }}
+                className="flex items-center gap-1 text-kraken-purple text-xs hover:underline mt-1">
+                <Plus size={12} /> Добавить персону
+              </button>
             </div>
           </DraggableBlock>
         )}
@@ -790,6 +772,9 @@ export default function LiveMonitor({
               person={detectedPerson}
               confidence={detectedFace?.confidence}
               cameraName={cameras.find(c => c.id === selectedCameraId)?.name}
+              cameraId={selectedCameraId}
+              lastUpdatedAt={lastFaceTimestamp}
+              onAddGuest={handleQuickAddGuest}
             />
           </DraggableBlock>
         )}
@@ -799,8 +784,9 @@ export default function LiveMonitor({
       {showAddModal && (
         <QuickPersonModal
           person={editPerson}
-          onClose={() => { setShowAddModal(false); setEditPerson(null) }}
-          onSaved={() => { setShowAddModal(false); setEditPerson(null); fetchPeople() }}
+          onClose={() => { setShowAddModal(false); setEditPerson(null); setGuestInitialPhotos([]) }}
+          onSaved={() => { setShowAddModal(false); setEditPerson(null); setGuestInitialPhotos([]); fetchPeople() }}
+          initialPhotos={guestInitialPhotos}
         />
       )}
       {showRoi && selectedCamera && (
@@ -830,19 +816,105 @@ export default function LiveMonitor({
           onClose={() => setAlertState(null)}
         />
       )}
+
+      {/* ── База людей: drawer 50% справа ── */}
+      {showPeopleDrawer && (
+        <div className="fixed inset-0 z-50 flex">
+          <div className="absolute inset-0 bg-black/60" onClick={() => setShowPeopleDrawer(false)} />
+          <div className="relative ml-auto w-full max-w-[50vw] h-full bg-kraken-panel border-l border-kraken-border shadow-2xl animate-fade-in overflow-hidden flex flex-col">
+            <div className="flex items-center justify-between p-4 border-b border-kraken-border flex-shrink-0">
+              <div>
+                <div className="text-kraken-text text-sm font-semibold">База людей</div>
+                <div className="text-kraken-disabled text-[10px]">{people.length} персон</div>
+              </div>
+              <button onClick={() => setShowPeopleDrawer(false)} className="text-kraken-muted hover:text-kraken-text">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              <table className="w-full">
+                <thead className="sticky top-0 bg-kraken-panel z-10">
+                  <tr className="text-kraken-disabled text-[10px] uppercase tracking-wider border-b border-kraken-border">
+                    <th className="px-4 py-2 text-left">Фото</th>
+                    <th className="px-4 py-2 text-left">Имя</th>
+                    <th className="px-4 py-2 text-left">Категория</th>
+                    <th className="px-4 py-2 text-left">Комментарий</th>
+                    <th className="px-4 py-2 text-right">Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {loadingPeople && (
+                    <tr><td colSpan={5} className="text-center py-8 text-kraken-disabled text-xs">Загрузка...</td></tr>
+                  )}
+                  {!loadingPeople && people.length === 0 && (
+                    <tr><td colSpan={5} className="text-center py-8">
+                      <div className="text-kraken-disabled text-sm mb-2">База пуста</div>
+                      <button onClick={() => { setEditPerson(null); setShowAddModal(true); setShowPeopleDrawer(false) }}
+                        className="text-kraken-purple text-xs hover:underline">+ Добавить</button>
+                    </td></tr>
+                  )}
+                  {people.map(p => (
+                    <tr key={p.id} className="border-b border-kraken-border hover:bg-kraken-hover transition-colors">
+                      <td className="px-4 py-2">
+                        <div className="w-12 h-12 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border">
+                          {p.photo_path
+                            ? <img src={`${PHOTO_BASE}/${p.photo_path}`} alt="" className="w-full h-full object-cover" />
+                            : <div className="w-full h-full flex items-center justify-center text-lg">👤</div>}
+                        </div>
+                      </td>
+                      <td className="px-4 py-2 text-kraken-text text-sm font-medium">{p.name}</td>
+                      <td className="px-4 py-2"><CategoryBadge category={p.category} /></td>
+                      <td className="px-4 py-2 text-kraken-muted text-sm max-w-[200px] truncate">{p.comment ?? '—'}</td>
+                      <td className="px-4 py-2">
+                        <div className="flex items-center gap-1 justify-end">
+                          <button onClick={() => { setEditPerson(p); setShowAddModal(true) }}
+                            className="p-1.5 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-purple transition-colors"
+                            title="Редактировать">
+                            <Edit2 size={14} />
+                          </button>
+                          {selectedCameraId && (
+                            <button
+                              onClick={() => handleAddPhotoFromCamera(p.id, selectedCameraId)}
+                              className="p-1.5 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-green transition-colors"
+                              title="Обновить фото"
+                            >
+                              <ImagePlus size={14} />
+                            </button>
+                          )}
+                          <button onClick={() => handleDelete(p.id)}
+                            className="p-1.5 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-red transition-colors"
+                            title="Удалить">
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
 // ── LastGuestBlock ────────────────────────────────────────────────────────────
 
-function LastGuestBlock({ person, confidence, cameraName }: {
+function LastGuestBlock({ person, confidence, cameraName, cameraId, lastUpdatedAt, onAddGuest }: {
   person: Person | null
   confidence?: number
   cameraName?: string
+  cameraId?: number
+  lastUpdatedAt?: number
+  onAddGuest?: () => void
 }) {
   const [loyalty, setLoyalty] = useState<any>(null)
   const [personDetails, setPersonDetails] = useState<Person | null>(null)
+  const [showAddModal, setShowAddModal] = useState(false)
+  const [adding, setAdding] = useState(false)
+  const [addError, setAddError] = useState('')
 
   useEffect(() => {
     if (!person?.id) { setLoyalty(null); setPersonDetails(null); return }
@@ -858,11 +930,30 @@ function LastGuestBlock({ person, confidence, cameraName }: {
   const lastVisit = personDetails?.last_seen_at ?? null
   const visitCount = personDetails?.visit_count ?? person?.visit_count ?? 0
 
-  if (!person) {
+  const isStale = lastUpdatedAt ? Date.now() - lastUpdatedAt > 3 * 60_000 : false
+
+  if (!person || isStale) {
     return (
       <div className="h-full flex flex-col items-center justify-center gap-2 text-kraken-disabled p-4">
         <div className="text-4xl opacity-20">👤</div>
         <div className="text-xs text-center">Ожидание распознавания...</div>
+        {!person && cameraId && (
+          <button
+            onClick={async () => {
+              setAddError('')
+              if (onAddGuest) {
+                onAddGuest()
+              } else {
+                setShowAddModal(true)
+              }
+            }}
+            disabled={adding}
+            className="mt-2 text-xs px-3 py-1.5 rounded-lg bg-kraken-purple/20 text-kraken-purple hover:bg-kraken-purple/30 transition-colors disabled:opacity-50"
+          >
+            ＋ Добавить в базу
+          </button>
+        )}
+        {addError && <div className="text-kraken-red text-[10px]">{addError}</div>}
       </div>
     )
   }
@@ -969,7 +1060,7 @@ function LastGuestBlock({ person, confidence, cameraName }: {
 
 // ── Person Modal — мультифото + камера ───────────────────────────────────────
 
-interface ModalProps { person: Person | null; onClose: () => void; onSaved: () => void }
+interface ModalProps { person: Person | null; onClose: () => void; onSaved: () => void; initialPhotos?: File[] }
 
 type PhotoTab = 'upload' | 'camera'
 interface PhotoEntry { file: File; preview: string }
@@ -1035,7 +1126,7 @@ function LiveCameraPreview({ cameraId }: { cameraId: number }) {
   )
 }
 
-function QuickPersonModal({ person, onClose, onSaved }: ModalProps) {
+function QuickPersonModal({ person, onClose, onSaved, initialPhotos }: ModalProps) {
   const [name, setName]         = useState(person?.name ?? '')
   const [category, setCategory] = useState<Category>(person?.category ?? 'CLIENT')
   const [comment, setComment]   = useState(person?.comment ?? '')
@@ -1067,6 +1158,16 @@ function QuickPersonModal({ person, onClose, onSaved }: ModalProps) {
       }).catch(() => {})
     }
   }, [photoTab])
+
+  useEffect(() => {
+    if (initialPhotos && initialPhotos.length > 0) {
+      initialPhotos.forEach(file => {
+        const reader = new FileReader()
+        reader.onload = e => setPhotos(prev => [...prev, { file, preview: e.target?.result as string }])
+        reader.readAsDataURL(file)
+      })
+    }
+  }, [])
 
   const addFiles = (files: FileList | null) => {
     if (!files) return

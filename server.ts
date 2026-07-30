@@ -8,6 +8,13 @@ import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import { spawn, exec, ChildProcessWithoutNullStreams } from "child_process";
 import { promisify } from "util";
+import dotenv from "dotenv";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+
+// Загрузка .env ДО всех остальных импортов
+dotenv.config();
 
 const execAsync = promisify(exec);
 import sharp from "sharp";
@@ -16,10 +23,14 @@ import * as unzipper from "unzipper";
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
 import AdmZip from "adm-zip";
+import iconv from "iconv-lite";
+import axios from "axios";
+import { XMLParser } from "fast-xml-parser";
 import {
   initFaceEngine,
   initFaceEngineWithDB,
   detectFaces,
+  detectFacesWithDistance,
   detectFacesFast,
   getEmbedding,
   extractEmbedding,
@@ -32,9 +43,13 @@ import {
   assessPhotoQuality,
   searchByDescriptor,
   addEmbeddingToPerson,
+  getEmbeddingCountForPerson,
+  removeDescriptorsByPhotoPath,
 } from "./face-engine.js";
 import { prisma } from "./db.js";
 import logger, { logInfo, logError, logWarn, logDebug } from "./src/lib/logger.js";
+import { recordProxyStat } from "./src/lib/ai-quality.js";
+import { isInRange, faceWidthPx } from "./src/lib/detection-helpers.js";
 
 // ── __filename / __dirname ────────────────────────────────────────────────────
 // tsx запускает файл как ESM-модуль → используем import.meta.url напрямую.
@@ -58,7 +73,35 @@ const HOST = process.env.HOST || "0.0.0.0";
 // Если не задан — сервер работает открыто (dev), но выводит предупреждение.
 const API_KEY = process.env.API_KEY || "";
 
-app.use(express.json());
+const UNV_MAX_SNAPSHOT_WIDTH = parseInt(process.env.UNV_MAX_SNAPSHOT_WIDTH || "1280", 10);
+const UNV_MAX_SNAPSHOT_HEIGHT = parseInt(process.env.UNV_MAX_SNAPSHOT_HEIGHT || "720", 10);
+
+// ── SECURITY MIDDLEWARE ──────────────────────────────────────────────
+app.use(helmet());
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
+}));
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: "Too many requests, please try again later.",
+});
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: "Too many upload requests, please try again later.",
+});
+app.use("/api", apiLimiter);
+app.use("/webhooks", apiLimiter);
+
+app.use(express.json({ limit: "10mb" }));
 
 // Middleware для логирования запросов
 app.use((req, res, next) => {
@@ -137,7 +180,7 @@ app.use("/photos", apiKeyAuth, express.static(photosDir));
 app.use("/snapshots", apiKeyAuth, express.static(snapshotsDir));
 app.use("/recordings", apiKeyAuth, express.static(recordingsDir));
 
-// Multer upload setup
+// Multer upload setup with size limits
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, photosDir);
@@ -153,7 +196,7 @@ const upload = multer({
   storage,
   limits: {
     fileSize: 10 * 1024 * 1024, // 10 МБ
-    files: 50,
+    files: 500,
   },
   fileFilter: (req, file, cb) => {
     if (ALLOWED_IMAGE_MIME.has(file.mimetype)) {
@@ -163,6 +206,59 @@ const upload = multer({
     }
   },
 });
+
+// ── Утилиты нормализации и кодировки (для импорта людей) ──
+
+function fixDoubleEncodedCyrillic(value: string): string {
+  if (typeof value !== 'string' || !value) return value;
+  if (/[а-яА-ЯёЁ]/.test(value)) return value;
+
+  try {
+    const decoded = iconv.decode(Buffer.from(value, 'latin1'), 'utf8');
+    if (decoded && /[а-яА-ЯёЁ]/.test(decoded)) return decoded;
+  } catch {}
+
+  return value;
+}
+
+function normalizePersonName(name: string): string {
+  if (!name) return name;
+  name = name.replace(/\s*\([^\)]*\)\s*/g, ' ').trim();
+  let normalized = name.replace(/\s+/g, ' ').trim().replace(/^[\s\-_]+|[\s\-_]+$/g, '');
+
+  return normalized.split(' ').map(w => {
+    if (!w || /^\d+$/.test(w)) return w;
+    if (w.includes('-')) {
+      return w.split('-').map(p => /^\d+$/.test(p) ? p : p.charAt(0).toUpperCase() + p.slice(1).toLowerCase()).join('-');
+    }
+    return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+  }).join(' ');
+}
+
+function normalizePositionName(pos: string): string {
+  if (!pos) return pos;
+  pos = pos.replace(/\s*\([^\)]*\)\s*/g, ' ').trim();
+  const words = pos.replace(/\s+/g, ' ').trim().split(' ').filter(w => w);
+  if (words.length === 0) return pos;
+
+  return words.map((w, i) => {
+    if (!w || /^\d+$/.test(w)) return w;
+    return i === 0 ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : w.toLowerCase();
+  }).join(' ');
+}
+
+function getDuplicateKey(name: string, position: string = ""): string {
+  return `${normalizePersonName(name)}|${normalizePositionName(position)}`.toLowerCase();
+}
+
+function fixFilesEncoding(files: Express.Multer.File[]): void {
+  if (!files || !Array.isArray(files)) return;
+  for (const file of files) {
+    if (file && typeof file.originalname === 'string') {
+      file.originalname = fixDoubleEncodedCyrillic(file.originalname);
+    }
+  }
+}
 
 // ── STATEFUL IN-MEMORY DATABASES ──
 // NOTE: cameras и persons используются как кэш из Prisma (синхронизируются при старте и мутациях).
@@ -233,6 +329,16 @@ let recordingsData: Record<number, Record<string, any[]>> = {};
 function sanitizeCamera(cam: any): any {
   if (!cam) return cam;
   const { username, password, ...safe } = cam;
+  try {
+    if (typeof safe.roi_zones === "string") {
+      safe.roi_zones = JSON.parse(safe.roi_zones);
+    }
+    if (typeof safe.exclusion_zones === "string") {
+      safe.exclusion_zones = JSON.parse(safe.exclusion_zones);
+    }
+  } catch {
+    // keep raw values if parse fails
+  }
   return safe;
 }
 
@@ -310,6 +416,52 @@ app.post(["/api/cameras/:id/stop", "/api/cameras/:id/stop/"], async (req, res) =
   }
 });
 
+app.post(["/api/cameras/:id/restart", "/api/cameras/:id/restart/"], async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const cam = cameras.find((c) => c.id === id);
+    if (!cam) return res.status(404).json({ detail: "Camera not found" });
+
+    logWarn(`[API] Принудительный перезапуск камеры ${id} (${cam.name})`);
+
+    // 1. Останавливаем текущий пайплайн (убиваем FFmpeg, чистим таймеры)
+    stopCameraPipeline(id);
+
+    // 2. Сбрасываем backoff-счётчик, чтобы не ждать экспоненциальную задержку
+    cameraFfmpegRetries.delete(id);
+
+    // 3. Не сбрасываем transportFallback — если TCP уже падал,
+    //    при перезапуске через API нужно сохранить выбор транспорта.
+    //    Если нужно принудительно переключить — фронтенд может передать query-параметр.
+    const forceTransport = req.query.transport as "tcp" | "udp" | undefined;
+    if (forceTransport === "tcp" || forceTransport === "udp") {
+      cameraTransportFallback.set(id, forceTransport);
+      logInfo(`[API] Камера ${id}: принудительный транспорт ${forceTransport}`);
+    }
+
+    // 4. Запускаем заново — он прочитает актуальное состояние fallback
+    const assetsDir = path.join(__dirname, process.env.NODE_ENV === "production" ? "../public/assets" : "public/assets");
+    const rusSrc = path.join(assetsDir, "rus.jpg");
+    const logoSrc = path.join(assetsDir, "logo.jpg");
+    let fallbackFrame: string;
+    if (fs.existsSync(rusSrc)) fallbackFrame = fs.readFileSync(rusSrc).toString("base64");
+    else if (fs.existsSync(logoSrc)) fallbackFrame = fs.readFileSync(logoSrc).toString("base64");
+    else fallbackFrame = FALLBACK_JPEG;
+
+    const transport = cameraTransportFallback.get(id) || "tcp";
+    startCameraPipeline(cam, fallbackFrame, transport);
+
+    res.json({
+      success: true,
+      message: `Pipeline камеры ${id} перезапущен`,
+      currentFallback: cameraTransportFallback.get(id) || "tcp",
+    });
+  } catch (err: any) {
+    logError(err as Error, { context: "camera restart API", cameraId: req.params.id });
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 function findNameAndSimilarity(obj: any): { name?: string, similarity?: number } {
   if (!obj || typeof obj !== 'object') return {};
   let name: string | undefined;
@@ -342,76 +494,65 @@ function findNameAndSimilarity(obj: any): { name?: string, similarity?: number }
   return { name, similarity };
 }
 
-app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/api/cameras/unv/webhook", "/api/cameras/unv/webhook/"], upload.any(), (req, res) => {
+function downscaleSnapshot(filePath: string, maxWidth: number, maxHeight: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    sharp(filePath).metadata().then((metadata) => {
+      if (metadata.width && metadata.height && (metadata.width > maxWidth || metadata.height > maxHeight)) {
+        sharp(filePath)
+          .resize(maxWidth, maxHeight, { fit: "inside", withoutEnlargement: true })
+          .toFile(filePath + ".tmp")
+          .then(() => {
+            if (fs.existsSync(filePath + ".tmp")) fs.renameSync(filePath + ".tmp", filePath);
+            resolve();
+          })
+          .catch(() => resolve());
+      } else {
+        resolve();
+      }
+    }).catch(() => resolve());
+  });
+}
+
+app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/api/cameras/unv/webhook", "/api/cameras/unv/webhook/"], upload.any(), async (req, res) => {
   logDebug("UNV LAPI Webhook received", { headers: req.headers['content-type'], query: req.query, bodyKeys: Object.keys(req.body) });
-  
+
+  const sendUnvSuccess = () => {
+    res.setHeader("Content-Type", "application/json");
+    res.status(200).json({ ResponseCode: 0, ResponseString: "Succeed" });
+  };
+
   let cameraId = parseInt(req.query.camera_id as string || req.query.id as string || "");
   let camera = cameras.find(c => c.id === cameraId);
-  
+
   if (!camera) {
-    // Fallback: match by IP address
     const incomingIp = req.ip || req.socket.remoteAddress || "";
     logDebug("Attempting to find UNV camera by IP", { incomingIp });
-    camera = cameras.find(c => 
-      c.camera_type === "UNV" && 
-      c.ip_address && 
+    camera = cameras.find(c =>
+      c.camera_type === "UNV" &&
+      c.ip_address &&
       (incomingIp.includes(c.ip_address) || c.ip_address.includes(incomingIp))
     );
   }
-  
+
   if (!camera) {
     camera = cameras.find(c => c.camera_type === "UNV") || cameras[0];
   }
 
   if (!camera) {
-    return res.status(404).json({ error: "No cameras configured to receive UNV notification" });
+    logWarn("UNV Webhook: Камера не найдена, но возвращаем успех для предотвращения спама");
+    return sendUnvSuccess();
   }
 
   logInfo(`UNV webhook → camera ID ${camera.id} (${camera.name})`);
 
-  // Parse JSON data from any fields or body
-  let parsedPayload: any = null;
-  
-  if (req.body && Object.keys(req.body).length > 0) {
-    parsedPayload = req.body;
-  }
-  
-  for (const key of Object.keys(req.body)) {
-    const val = req.body[key];
-    if (typeof val === 'string' && (val.trim().startsWith('{') || val.trim().startsWith('['))) {
-      try {
-        parsedPayload = JSON.parse(val);
-        logDebug(`Parsed JSON from form field "${key}"`);
-        break;
-      } catch (err) {
-        // ignore
-      }
-    }
-  }
+  let snapshot_path = "snapshots/ev1.jpg";
+  let imageBuffer: Buffer | null = null;
+  const filesList = (req.files || []) as Express.Multer.File[];
 
-  let personName: string | undefined;
-  let confidence: number | undefined;
-
-  if (parsedPayload) {
-    const extracted = findNameAndSimilarity(parsedPayload);
-    personName = extracted.name;
-    confidence = extracted.similarity;
-  }
-
-  logDebug(`UNV extracted name: "${personName}", similarity: ${confidence}`);
-
-  // Helper for smart capture naming according to user request format (ДДММГГГГ_ЧЧММСС_Неизвестный)
-  const getSmartCaptureFilename = (pName?: string, ext = ".jpg") => {
+  const getSmartFilename = (pName?: string, ext = ".jpg") => {
     const now = new Date();
-    const day = String(now.getDate()).padStart(2, '0');
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const year = now.getFullYear();
-    const hours = String(now.getHours()).padStart(2, '0');
-    const minutes = String(now.getMinutes()).padStart(2, '0');
-    const seconds = String(now.getSeconds()).padStart(2, '0');
-    const dateStr = `${day}${month}${year}`;
-    const timeStr = `${hours}${minutes}${seconds}`;
-
+    const dateStr = `${String(now.getDate()).padStart(2, '0')}${String(now.getMonth() + 1).padStart(2, '0')}${now.getFullYear()}`;
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
     const isUnknown = !pName || pName.toLowerCase() === 'unknown' || pName.toLowerCase() === 'неизвестный' || pName.toLowerCase() === 'неизвестный клиент';
     if (isUnknown) {
       return `${dateStr}_${timeStr}_Неизвестный${ext}`;
@@ -420,84 +561,93 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
     }
   };
 
-  // Save the uploaded snapshot file if present
-  let snapshot_path = "snapshots/ev1.jpg";
-  const filesList = (req.files || []) as Express.Multer.File[];
-  
   if (filesList.length > 0) {
     const file = filesList[0];
-    const targetFilename = getSmartCaptureFilename(personName, path.extname(file.originalname) || '.jpg');
+    const targetFilename = getSmartFilename(path.extname(file.originalname) || '.jpg');
     const targetPath = path.join(snapshotsDir, targetFilename);
     try {
       fs.copyFileSync(file.path, targetPath);
       snapshot_path = `snapshots/${targetFilename}`;
       logInfo(`UNV snapshot saved: ${snapshot_path}`);
+      await downscaleSnapshot(targetPath, UNV_MAX_SNAPSHOT_WIDTH, UNV_MAX_SNAPSHOT_HEIGHT);
+      imageBuffer = await fs.promises.readFile(targetPath);
     } catch (err) {
       logError(err as Error, { context: "UNV snapshot copy" });
     }
   } else {
-    let base64Image: string | null = null;
     for (const key of Object.keys(req.body)) {
       const val = req.body[key];
-      if (typeof val === 'string' && (val.startsWith('data:image') || val.length > 1000 && /^[A-Za-z0-9+/=]+$/.test(val.slice(0, 100)))) {
-        base64Image = val;
-        break;
-      }
-    }
-    if (base64Image) {
-      try {
-        const base64Data = base64Image.includes('base64,') ? base64Image.split('base64,')[1] : base64Image;
-        const targetFilename = getSmartCaptureFilename(personName, ".jpg");
-        const targetPath = path.join(snapshotsDir, targetFilename);
-        fs.writeFileSync(targetPath, Buffer.from(base64Data, 'base64'));
-        snapshot_path = `snapshots/${targetFilename}`;
-        logInfo(`UNV base64 snapshot saved: ${snapshot_path}`);
-      } catch (err) {
-        logError(err as Error, { context: "UNV base64 snapshot" });
+      if (typeof val === 'string' && (val.startsWith('data:image') || val.length > 1000)) {
+        try {
+          const base64Data = val.includes('base64,') ? val.split('base64,')[1] : val;
+          const targetFilename = getSmartFilename(".jpg");
+          const targetPath = path.join(snapshotsDir, targetFilename);
+          imageBuffer = Buffer.from(base64Data, 'base64');
+          await fs.promises.writeFile(targetPath, imageBuffer);
+          snapshot_path = `snapshots/${targetFilename}`;
+          await downscaleSnapshot(targetPath, UNV_MAX_SNAPSHOT_WIDTH, UNV_MAX_SNAPSHOT_HEIGHT);
+          break;
+        } catch (err) {
+          logError(err as Error, { context: "UNV base64 snapshot" });
+        }
       }
     }
   }
 
-  // Async: lookup person in DB and persist event
+  let matchedPerson: any = null;
+  let confidence = 0;
+  let eventType = "UNKNOWN";
+
+  if (imageBuffer) {
+    try {
+      const tempPath = path.join(snapshotsDir, `unv_temp_${Date.now()}.jpg`);
+      await fs.promises.writeFile(tempPath, imageBuffer);
+      const threshold = recognition_threshold_pct / 100;
+      const matches = await searchByPhoto(tempPath, threshold, 1);
+      if (matches && matches.length > 0) {
+        const bestMatch = matches[0];
+        confidence = bestMatch.similarity;
+        matchedPerson = await prisma.person.findUnique({
+          where: { id: bestMatch.personId },
+          include: { photos: true }
+        });
+        if (matchedPerson) {
+          eventType = matchedPerson.category === "BLACKLIST" ? "BLACKLIST_ALERT" :
+                     matchedPerson.category === "VIP" ? "VIP_ARRIVAL" :
+                     matchedPerson.category === "RESPONSE" ? "RESPONSE_ALERT" : "RECOGNIZED";
+        }
+      }
+    } catch (err) {
+      logError(err as Error, { context: "UNV face recognition" });
+    }
+  }
+
   (async () => {
     try {
-      let matchedPerson: any = null;
-      if (personName && personName.toLowerCase() !== "unknown" && personName.toLowerCase() !== "неизвестный") {
-        const allPersons = await prisma.person.findMany({ select: { id: true, name: true, category: true, photo_path: true, visit_count: true } });
-        matchedPerson = allPersons.find((p: any) => p.name.toLowerCase() === personName!.toLowerCase());
-      }
-
       if (matchedPerson) {
         await prisma.person.update({
           where: { id: matchedPerson.id },
-          data: { visit_count: { increment: 1 }, last_seen_at: new Date() },
+          data: { visit_count: { increment: 1 }, last_seen_at: new Date() }
         });
-        // Sync in-memory
         const idx = persons.findIndex((p) => p.id === matchedPerson.id);
         if (idx >= 0) { persons[idx].visit_count++; persons[idx].last_seen_at = new Date().toISOString(); }
 
-        let event_type = "RECOGNIZED";
-        if (matchedPerson.category === "VIP") event_type = "VIP_ARRIVAL";
-        else if (matchedPerson.category === "BLACKLIST") event_type = "BLACKLIST_ALERT";
-        else if (matchedPerson.category === "RESPONSE") event_type = "RESPONSE_ALERT";
-
-        const eventConfidence = confidence || 0.85;
-        const meetsVerification = (eventConfidence * 100) >= verification_threshold_pct;
+        const meetsVerification = (confidence * 100) >= verification_threshold_pct;
 
         await prisma.event.create({
           data: {
             camera_id: camera.id,
             camera_name: camera.name,
             person_id: matchedPerson.id,
-            event_type,
-            confidence: eventConfidence,
+            event_type: eventType,
+            confidence,
             snapshot_path,
             person_name: matchedPerson.name,
             person_category: matchedPerson.category,
-            person_photo_path: matchedPerson.photo_path,
+            person_photo_path: matchedPerson.photos[0]?.photo_path || null,
             needs_operator_confirmation: !meetsVerification,
             confirmation_status: !meetsVerification ? "pending" : null,
-          },
+          }
         });
 
         broadcastSecurity({
@@ -506,7 +656,7 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
           person_id: matchedPerson.id,
           person_name: matchedPerson.name,
           camera_id: camera.id,
-          confidence: eventConfidence,
+          confidence,
           snapshot_path,
           timestamp: new Date().toISOString(),
         });
@@ -519,14 +669,14 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
             event_type: "UNKNOWN",
             confidence: confidence || 0.5,
             snapshot_path,
-            person_name: personName || "Неизвестный",
+            person_name: "Неизвестный",
             person_category: "CLIENT",
-          },
+          }
         });
         broadcastSecurity({
           type: "ALERT",
           category: "CLIENT",
-          person_name: personName || "Неизвестный",
+          person_name: "Неизвестный",
           camera_id: camera.id,
           confidence: confidence || 0.5,
           snapshot_path,
@@ -539,20 +689,168 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
     }
   })();
 
-  res.json({ success: true, camera_id: camera.id, processed: true });
+  sendUnvSuccess();
 });
+
+app.post(
+  ["/webhooks/camera", "/webhooks/camera/"],
+  express.text({ type: ["application/xml", "application/json", "text/plain"] }),
+  async (req, res) => {
+    try {
+      const clientIp = (req.ip || req.socket.remoteAddress || "").replace(/^::ffff:/i, "");
+
+      const now = Date.now();
+      const lastTime = webhookCooldown.get(clientIp) || 0;
+      if (now - lastTime < 2000) {
+        return res.status(200).send("OK");
+      }
+
+      const payload = typeof req.body === "string" ? req.body.toLowerCase() : JSON.stringify(req.body).toLowerCase();
+      const isTrigger = ["face", "human", "vmd", "regionentrance", "linedetection", "intelligent", "alarm", "motion"].some((keyword) => payload.includes(keyword));
+      
+      if (!isTrigger) {
+        return res.status(200).send("OK");
+      }
+
+      const camera = cameras.find((c) => c.ip_address === clientIp);
+      if (!camera) {
+        logInfo(`[Webhook] Алерт от неизвестной камеры IP: ${clientIp}`);
+        return res.status(200).send("OK");
+      }
+
+      webhookCooldown.set(clientIp, now);
+      logInfo(`📸 [Webhook] Событие детекции от ${camera.name} (${clientIp})`);
+
+      res.status(200).send("OK"); 
+      
+      processCameraEventInBackground(camera).catch((err) => {
+        logError(err as Error, { context: "Background camera processing", cameraId: camera.id });
+      });
+
+    } catch (err) {
+      logError(err as Error, { context: "Webhook endpoint crash" });
+      res.status(200).send("OK");
+    }
+  }
+);
+
+const webhookCooldown = new Map<string, number>();
+
+async function fetchCameraSnapshot(camera: any): Promise<Buffer | null> {
+  const brand = (camera.camera_type || "").toLowerCase().includes("unv") ? "uniview" : "hikvision";
+  const snapshotPath = brand === "uniview" ? "/images/snapshot.jpg" : "/ISAPI/Streaming/channels/101/picture";
+  const auth = camera.username && camera.password ? { username: camera.username, password: camera.password } : undefined;
+  const url = `http://${camera.ip_address}${snapshotPath}`;
+
+  try {
+    const response = await axios.get(url, { 
+      responseType: "arraybuffer", 
+      auth, 
+      timeout: 3000,
+      maxRedirects: 0 
+    });
+    
+    const buffer = Buffer.from(response.data);
+    if (buffer.length > 2 && buffer[0] === 0xff && buffer[1] === 0xd8) {
+      return buffer;
+    }
+    logInfo(`[Snapshot] Неверный формат данных от ${camera.ip_address}`);
+  } catch (err: any) {
+    logInfo(`[Snapshot] Не удалось получить снимок с ${camera.ip_address}: ${err.message}`);
+  }
+  return null;
+}
+
+async function processCameraEventInBackground(camera: any) {
+  try {
+    const snapshotBuffer = await fetchCameraSnapshot(camera);
+    if (!snapshotBuffer) {
+      logInfo(`[Background] Пропуск: не удалось получить снимок с ${camera.name}`);
+      return;
+    }
+
+    const FormDataCtor = (globalThis as any).FormData || (await import('form-data')).default;
+    const form = new FormDataCtor();
+    form.append("image", snapshotBuffer, { filename: "snapshot.jpg", contentType: "image/jpeg" });
+    form.append("camera_id", String(camera.id));
+    
+    if (camera.detection_threshold) form.append("threshold", String(camera.detection_threshold));
+    if (camera.min_face_size) form.append("min_face_size", String(camera.min_face_size));
+    if (camera.max_face_size) form.append("max_face_size", String(camera.max_face_size));
+    if (camera.passage_roi_x_min != null) form.append("passage_roi_x_min", String(camera.passage_roi_x_min));
+    if (camera.passage_roi_x_max != null) form.append("passage_roi_x_max", String(camera.passage_roi_x_max));
+    if (camera.passage_roi_y_min != null) form.append("passage_roi_y_min", String(camera.passage_roi_y_min));
+    if (camera.passage_roi_y_max != null) form.append("passage_roi_y_max", String(camera.passage_roi_y_max));
+    if (camera.guard_ignore_x_max != null) form.append("guard_ignore_x_max", String(camera.guard_ignore_x_max));
+
+    const faceServerUrl = process.env.FACE_SERVER_URL || "http://localhost:8001";
+    const recognitionRes = await axios.post(`${faceServerUrl}/recognize`, form, {
+      headers: typeof form.getHeaders === "function" ? form.getHeaders() : { "Content-Type": "multipart/form-data" },
+      timeout: 5000,
+    });
+
+    const result: any = recognitionRes.data;
+
+    if (result.status === "ok" && result.matches && result.matches.length > 0) {
+      const bestMatch = result.matches[0];
+      const threshold = camera.detection_threshold || 0.65;
+      if (bestMatch.similarity >= threshold) {
+        logInfo(`✅ РАСПОЗНАН: ${bestMatch.person_name} (${(bestMatch.similarity * 100).toFixed(1)}%) на камере "${camera.name}"`);
+
+        const targetFilename = `${Date.now()}_${Math.floor(Math.random() * 10000)}.jpg`;
+        const snapshotsDir = path.join(publicDir, "snapshots");
+        if (!fs.existsSync(snapshotsDir)) fs.mkdirSync(snapshotsDir, { recursive: true });
+        
+        const targetPath = path.join(snapshotsDir, targetFilename);
+        await fs.promises.writeFile(targetPath, snapshotBuffer);
+        const savedSnapshotPath = `snapshots/${targetFilename}`;
+
+        await prisma.event.create({
+          data: {
+            camera_id: camera.id,
+            camera_name: camera.name,
+            person_id: bestMatch.person_id,
+            event_type: "RECOGNITION",
+            confidence: bestMatch.similarity,
+            snapshot_path: savedSnapshotPath,
+            person_name: bestMatch.person_name,
+            person_category: "CLIENT",
+            created_at: new Date(),
+          }
+        });
+
+        await prisma.person.update({
+          where: { id: bestMatch.person_id },
+          data: { 
+            visit_count: { increment: 1 },
+            last_seen_at: new Date()
+          }
+        });
+      } else {
+        logInfo(`⚠️ СОВПАДЕНИЕ НИЖЕ ПОРОГА: ${bestMatch.person_name} (${(bestMatch.similarity * 100).toFixed(1)}% < ${(threshold * 100).toFixed(1)}%) на "${camera.name}"`);
+      }
+    } else {
+      logInfo(`🔍 НЕИЗВЕСТНЫЙ: Лицо обнаружено на "${camera.name}", но не найдено в базе.`);
+    }
+
+  } catch (err: any) {
+    logError(err, { context: "Background recognition processing", cameraId: camera.id });
+  }
+}
 
 app.post(["/api/cameras/:id/test-connection", "/api/cameras/:id/test-connection/"], (req, res) => {
   const id = parseInt(req.params.id);
   const cam = cameras.find((c) => c.id === id);
   if (cam) {
     if (cam.camera_type === "UNV") {
+      const maxW = UNV_MAX_SNAPSHOT_WIDTH;
+      const maxH = UNV_MAX_SNAPSHOT_HEIGHT;
       res.json({
         connected: true,
         brand: "Uniview",
-        model: "IPC3238EA LAPI (Face Recognition Series)",
-        driver_type: "UNV LAPI Push Webhook / Готово к получению Face Push. Укажите адрес: http://ваш-сервер:3000/api/cameras/unv/notification?camera_id=" + cam.id,
-        resolution: "3840x2160 (4K UHD)",
+        model: "IPC3238EA-AHDZK-I1 (Face Recognition Series)",
+        driver_type: "UNV LAPI Push Webhook / Готов к получению Face Push. Укажите адрес: http://ваш-сервер:3000/api/cameras/unv/notification?camera_id=" + cam.id,
+        resolution: `${maxW}x${maxH}`,
         codec: "H.265 / Smart Face Stream",
         status_info: "Ожидание HTTP POST от камеры. Канал связи активен."
       });
@@ -649,6 +947,10 @@ app.post(["/api/cameras", "/api/cameras/"], async (req, res) => {
         is_active: req.body.is_active !== false,
         status: "online",
         roi_zones: req.body.roi_zones || null,
+        exclusion_zones: req.body.exclusion_zones || null,
+        detection_threshold: req.body.detection_threshold ?? null,
+        min_face_size: req.body.min_face_size ?? null,
+        max_face_size: req.body.max_face_size ?? null,
         fps: 25,
         ping_ms: 0,
         is_smart_recording: req.body.is_smart_recording || false,
@@ -673,15 +975,46 @@ app.post(["/api/cameras", "/api/cameras/"], async (req, res) => {
 app.put("/api/cameras/:id", async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    // Exclude fields that don't exist in Prisma schema
     const { created_at, ...updateData } = req.body;
+
+    // Проверяем, были ли изменены критические параметры подключения
+    const oldCam = cameras.find((c) => c.id === id);
+    const criticalChanged = oldCam && (
+      updateData.source !== undefined && updateData.source !== oldCam.source ||
+      updateData.username !== undefined && updateData.username !== oldCam.username ||
+      updateData.password !== undefined && updateData.password !== oldCam.password
+    );
+
     const updated = await prisma.camera.update({
       where: { id },
       data: updateData,
     });
+
     // Sync in-memory
     const index = cameras.findIndex((c) => c.id === id);
     if (index >= 0) cameras[index] = { ...cameras[index], ...updated };
+
+    // Если изменился URL потока, логин или пароль — перезапускаем пайплайн
+    if (criticalChanged && updated.is_active) {
+      logInfo(`[API] Камера ${id}: критические параметры изменены, перезапуск пайплайна`);
+      const transport = cameraTransportFallback.get(id) || "tcp";
+      destroyCameraResources(id);
+      const assetsDir = path.join(__dirname, process.env.NODE_ENV === "production" ? "../public/assets" : "public/assets");
+      const rusSrc = path.join(assetsDir, "rus.jpg");
+      const logoSrc = path.join(assetsDir, "logo.jpg");
+      let fallbackFrame: string;
+      if (fs.existsSync(rusSrc)) fallbackFrame = fs.readFileSync(rusSrc).toString("base64");
+      else if (fs.existsSync(logoSrc)) fallbackFrame = fs.readFileSync(logoSrc).toString("base64");
+      else fallbackFrame = FALLBACK_JPEG;
+      startCameraPipeline(updated, fallbackFrame, transport);
+    }
+
+    // Если камеру деактивировали — освобождаем все ресурсы
+    if (!updated.is_active && oldCam && oldCam.is_active) {
+      logInfo(`[API] Камера ${id}: деактивация, освобождаем ресурсы`);
+      destroyCameraResources(id);
+    }
+
     res.json(sanitizeCamera(updated));
   } catch (err) {
     logError(err as Error, { path: "/api/cameras/:id", method: "PUT" });
@@ -689,36 +1022,203 @@ app.put("/api/cameras/:id", async (req, res) => {
   }
 });
 
+app.get(["/api/cameras/:id/roi", "/api/cameras/:id/roi/"], async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    let cam = cameras.find((c) => c.id === id);
+    if (!cam) {
+      cam = await prisma.camera.findUnique({ where: { id } });
+    }
+    if (!cam) return res.status(404).json({ detail: "Camera not found" });
+    let roiZones = cam.roi_zones;
+    let exclusionZones = cam.exclusion_zones;
+    if (typeof roiZones === "string") {
+      try { roiZones = JSON.parse(roiZones); } catch { roiZones = []; }
+    }
+    if (typeof exclusionZones === "string") {
+      try { exclusionZones = JSON.parse(exclusionZones); } catch { exclusionZones = []; }
+    }
+    res.json({ zones: roiZones || [], exclusion_zones: exclusionZones || [] });
+  } catch (err) {
+    logError(err as Error, { path: "/api/cameras/:id/roi", method: "GET" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+app.put(["/api/cameras/:id/roi", "/api/cameras/:id/roi/"], async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { roi_zones, exclusion_zones } = req.body || {};
+    const updated = await prisma.camera.update({
+      where: { id },
+      data: {
+        roi_zones: roi_zones ? JSON.stringify(roi_zones) : undefined,
+        exclusion_zones: exclusion_zones ? JSON.stringify(exclusion_zones) : undefined,
+      },
+    });
+    const index = cameras.findIndex((c) => c.id === id);
+    if (index >= 0) cameras[index] = { ...cameras[index], ...updated };
+    res.json(sanitizeCamera(updated));
+  } catch (err) {
+    logError(err as Error, { path: "/api/cameras/:id/roi", method: "PUT" });
+    res.status(404).json({ detail: "Camera not found" });
+  }
+});
+
+// Preset for metal detector setup
+app.post(["/api/setup/metal-detector", "/api/setup/metal-detector/"], async (req, res) => {
+  try {
+    const { camera_id, name, source } = req.body || {};
+    let targetId = camera_id;
+
+    if (!targetId && name && source) {
+      const created = await prisma.camera.create({
+        data: {
+          name,
+          source,
+          camera_type: "RTSP",
+          zone: "Металлоискатель",
+          is_active: true,
+          status: "online",
+          detection_threshold: 0.8,
+          min_face_size: 80,
+        },
+      });
+      targetId = created.id;
+      cameras.push({ ...created });
+    }
+
+    if (!targetId) {
+      return res.status(400).json({ detail: "camera_id или name+source обязательны" });
+    }
+
+    const cam = await prisma.camera.findUnique({ where: { id: targetId } });
+    if (!cam) return res.status(404).json({ detail: "Camera not found" });
+
+    const w = 1280
+    const h = 720
+    const cx = Math.round(w * 0.5)
+    const cy = Math.round(h * 0.5)
+    const zw = Math.round(w * 0.35)
+    const zh = Math.round(h * 0.6)
+    const x1 = Math.max(0, cx - Math.round(zw / 2))
+    const y1 = Math.max(0, cy - Math.round(zh / 2))
+    const x2 = Math.min(w, cx + Math.round(zw / 2))
+    const y2 = Math.min(h, cy + Math.round(zh / 2))
+    const lw = Math.round(w * 0.18)
+    const lh = Math.round(h * 0.7)
+    const ly = Math.max(0, Math.round(h * 0.15))
+
+    const updated = await prisma.camera.update({
+      where: { id: targetId },
+      data: {
+        detection_threshold: 0.8,
+        min_face_size: 80,
+        roi_zones: JSON.stringify([{ x1, y1, x2, y2, label: "Металлоискатель", type: "detection" }]),
+        exclusion_zones: JSON.stringify([
+          { x1: 0, y1: ly, x2: lw, y2: ly + lh, label: "Охранник", type: "exclusion" },
+          { x1: Math.max(0, w - lw), y1: ly, x2: w, y2: ly + lh, label: "Терминал", type: "exclusion" },
+        ]),
+      },
+    });
+
+    const index = cameras.findIndex((c) => c.id === targetId);
+    if (index >= 0) cameras[index] = { ...cameras[index], ...updated };
+
+    res.json(sanitizeCamera(updated));
+  } catch (err) {
+    logError(err as Error, { path: "/api/setup/metal-detector", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
 app.delete(["/api/cameras/:id", "/api/cameras/:id/"], async (req, res) => {
   try {
     const id = parseInt(req.params.id);
+    const cam = cameras.find((c) => c.id === id);
+
+    if (!cam) {
+      return res.status(404).json({ detail: "Camera not found" });
+    }
+
+    // Полная зачистка ресурсов: FFmpeg, записи, WebSocket, таймеры, файлы
+    destroyCameraResources(id);
+
+    // Каскадное удаление из БД (Event и Recording удалятся via onDelete: Cascade)
     await prisma.camera.delete({ where: { id } });
+
+    // Удаление из оперативной памяти
     cameras = cameras.filter((c) => c.id !== id);
-    res.json({ success: true });
+
+    logInfo(`Камера ${cam.name} (${id}) удалена навсегда`);
+    broadcastSecurity({ type: "CAMERA_DELETED", camera_id: id, camera_name: cam.name });
+
+    res.json({ success: true, message: "Камера удалена навсегда" });
   } catch (err) {
     logError(err as Error, { path: "/api/cameras/:id", method: "DELETE" });
     res.status(404).json({ detail: "Camera not found" });
   }
 });
 
-app.get("/api/cameras/:id/snapshot", (req, res) => {
-  const id = parseInt(req.params.id);
-  let imageBuffer: Buffer;
-  const rusSrc = path.join(process.cwd(), "src", "assets", "rus.jpg");
-  const logoSrc = path.join(process.cwd(), "src", "assets", "logo.jpg");
+app.get("/api/cameras/:id/snapshot", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const cam = cameras.find((c) => c.id === id);
+    let imageBuffer: Buffer | null = null;
 
-  if (fs.existsSync(rusSrc)) {
-    imageBuffer = fs.readFileSync(rusSrc);
-  } else if (fs.existsSync(logoSrc)) {
-    imageBuffer = fs.readFileSync(logoSrc);
-  } else {
-    imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+    if (cam && cam.is_active && cam.source && !cam.source.startsWith("/dev/video")) {
+      const tempSnapPath = path.join(snapshotsDir, `temp_snap_${id}.jpg`);
+      try {
+        const ffmpegPath = getFfmpegPath();
+        await execAsync(`"${ffmpegPath}" -y -rtsp_transport tcp -i "${cam.source}" -vframes 1 -q:v 2 "${tempSnapPath}"`, { timeout: 5000 });
+        if (fs.existsSync(tempSnapPath)) {
+          imageBuffer = await fs.promises.readFile(tempSnapPath);
+          fs.unlinkSync(tempSnapPath);
+        }
+      } catch (ffmpegErr) {
+        logWarn(`Не удалось сделать живой снимок камеры ${id}: ${ffmpegErr}`);
+      }
+    }
+
+    if (!imageBuffer) {
+      const snapshotsDirPath = path.join(publicDir, "snapshots");
+      const matches: string[] = [];
+      if (fs.existsSync(snapshotsDirPath)) {
+        for (const entry of fs.readdirSync(snapshotsDirPath)) {
+          if (entry.startsWith(`cam${id}_`) && entry.endsWith(".jpg")) {
+            matches.push(path.join(snapshotsDirPath, entry));
+          }
+        }
+      }
+      if (matches.length > 0) {
+        matches.sort().reverse();
+        const latest = matches[0];
+        if (fs.existsSync(latest)) {
+          imageBuffer = fs.readFileSync(latest);
+        }
+      }
+    }
+
+    if (!imageBuffer) {
+      const rusSrc = path.join(process.cwd(), "src", "assets", "rus.jpg");
+      const logoSrc = path.join(process.cwd(), "src", "assets", "logo.jpg");
+      if (fs.existsSync(rusSrc)) {
+        imageBuffer = fs.readFileSync(rusSrc);
+      } else if (fs.existsSync(logoSrc)) {
+        imageBuffer = fs.readFileSync(logoSrc);
+      } else {
+        imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+      }
+    }
+
+    res.json({
+      image: imageBuffer.toString("base64"),
+      content_type: "image/jpeg",
+    });
+  } catch (err) {
+    logError(err as Error, { path: "/api/cameras/:id/snapshot" });
+    res.status(500).json({ detail: "Не удалось получить снимок" });
   }
-
-  res.json({
-    image: imageBuffer.toString("base64"),
-    content_type: "image/jpeg",
-  });
 });
 
 app.post("/api/cameras/:id/capture", (req, res) => {
@@ -945,28 +1445,50 @@ app.post(["/api/persons", "/api/persons/"], upload.any(), async (req, res) => {
     if (req.file) files.push(req.file);
     if (req.files && Array.isArray(req.files)) files = files.concat(req.files as Express.Multer.File[]);
 
-    let name = req.body.name || "Новый посетитель";
-    let position = req.body.position || null;
+    fixFilesEncoding(files);
+    if (req.body && typeof req.body === 'object') {
+      for (const key of Object.keys(req.body)) {
+        if (typeof req.body[key] === 'string') {
+          req.body[key] = fixDoubleEncodedCyrillic(req.body[key]);
+        }
+      }
+    }
+
+    let name = normalizePersonName(req.body.name || "Новый посетитель");
+    let position = req.body.position ? normalizePositionName(req.body.position) : null;
 
     if (files.length > 0 && (!req.body.name || req.body.name === "Новый посетитель" || req.body.name === "Новый человек")) {
       const originalName = files[0].originalname;
       const ext = path.extname(originalName);
-      const baseName = path.basename(originalName, ext).trim();
-      const normalized = baseName.replace(/_/g, ' ').replace(/\s+/g, ' ');
-      const words = normalized.split(' ');
+      const baseName = path.basename(originalName, ext).trim().replace(/\_/g, ' ').replace(/\s+/g, ' ');
+      const words = baseName.split(' ').filter(w => w);
 
       if (words.length >= 4) {
-        name = words.slice(0, 3).join(' ');
-        position = words.slice(3).join(' ');
-      } else if (words.length === 3) {
-        name = words.slice(0, 2).join(' ');
-        position = words[2];
+        name = normalizePersonName(words.slice(0, 3).join(' '));
+        position = normalizePositionName(words.slice(3).join(' '));
       } else {
-        name = normalized;
+        name = normalizePersonName(baseName);
       }
     }
 
-    const category = req.body.category || "CLIENT";
+    const dupKey = getDuplicateKey(name);
+    const category = (req.body.category || "CLIENT").toUpperCase();
+
+    const existingPersons = await prisma.person.findMany({
+      where: { category },
+      select: { id: true, name: true, category: true, photos: true }
+    });
+    const existingMatch = existingPersons.find((p: any) => getDuplicateKey(p.name) === dupKey);
+
+    if (existingMatch) {
+      return res.status(409).json({
+        detail: "Дубликат",
+        person_id: existingMatch.id,
+        person_name: existingMatch.name,
+        message: `Уже существует: "${existingMatch.name}"`
+      });
+    }
+
     const photosList = [];
     let embedding_count = 0;
 
@@ -1086,7 +1608,14 @@ app.post(["/api/persons/bulk_delete", "/api/persons/bulk_delete/"], async (req, 
   }
 });
 
-const importJobs: Record<string, any> = {};
+const importJobs = new Map<string, {
+  status: 'pending' | 'processing' | 'done' | 'error';
+  progress: number;
+  total: number;
+  processed: number;
+  results: any[];
+  error?: string;
+}>();
 
 app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any(), (req, res) => {
   let files: Express.Multer.File[] = [];
@@ -1097,115 +1626,102 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
     files = files.concat(req.files as Express.Multer.File[]);
   }
 
-  const category = (req.body.category || 'CLIENT').toUpperCase();
-  const jobId = `job_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  fixFilesEncoding(files);
+  if (req.body && typeof req.body === 'object') {
+    for (const key of Object.keys(req.body)) {
+      if (typeof req.body[key] === 'string') {
+        req.body[key] = fixDoubleEncodedCyrillic(req.body[key]);
+      }
+    }
+  }
 
-  importJobs[jobId] = {
+  const category = (req.body.category || 'CLIENT').toUpperCase();
+  const jobId = `import_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+  importJobs.set(jobId, {
     status: 'pending',
     progress: 0,
-    created: [],
-    failed: [],
-    skipped: []
-  };
+    total: files.length,
+    processed: 0,
+    results: []
+  });
 
-  // Process files asynchronously
-  setTimeout(async () => {
-    const job = importJobs[jobId];
+  setImmediate(async () => {
+    const job = importJobs.get(jobId);
     if (!job) return;
     job.status = 'processing';
+
+    const existingAll = await prisma.person.findMany({
+      where: { category },
+      select: { id: true, name: true, category: true, position: true, photos: true }
+    });
+
+    const personMap = new Map<string, any>();
+    for (const p of existingAll) {
+      const key = getDuplicateKey(p.name, p.position || "");
+      personMap.set(key, p);
+    }
 
     for (let index = 0; index < files.length; index++) {
       const f = files[index];
       try {
-        const originalName = f.originalname;
-        const ext = path.extname(originalName);
-        const baseName = path.basename(originalName, ext);
+        const baseName = path.basename(f.originalname, path.extname(f.originalname));
+        const lastDashIdx = baseName.lastIndexOf('-');
+        let rawName = lastDashIdx > 0 ? baseName.substring(0, lastDashIdx).trim() : baseName;
+        let rawPosition = lastDashIdx > 0 ? baseName.substring(lastDashIdx + 1).trim() : null;
 
-        let rawName = baseName;
-        let rawPosition: string | null = null;
-        if (baseName.includes('-')) {
-          const parts = baseName.split('-');
-          rawName = parts[0].trim();
-          rawPosition = parts.slice(1).join('-').trim();
-        }
-
-        const formattedName = rawName.replace(/_/g, ' ').trim();
-        let name = formattedName || "Новый посетитель";
-        if (name === name.toUpperCase() || name === name.toLowerCase()) {
-          name = name.split(/\s+/).map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : '').join(' ');
-        }
-        const cleanName = name.replace(/\s+\d+$/, '').replace(/\s*\(\d+\)$/, '').trim();
-
-        let position: string | null = null;
-        if (rawPosition) {
-          position = rawPosition.replace(/_/g, ' ').trim();
-          if (position === position.toUpperCase() || position === position.toLowerCase()) {
-            position = position.split(/\s+/).map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : '').join(' ');
-          }
-        }
-
+        const name = normalizePersonName(rawName.replace(/\_/g, ' ').trim()) || "Новый посетитель";
+        const position = rawPosition ? normalizePositionName(rawPosition.replace(/\_/g, ' ').trim()) : null;
         const photo_path = `photos/${f.filename}`;
         const fullPath = path.join(publicDir, photo_path);
+        const dupKey = getDuplicateKey(name, position || "");
+        const existingPerson = personMap.get(dupKey) || null;
 
-        // Ищем существующую персону в БД (case-insensitive для SQLite)
-        const existingPersons = await prisma.person.findMany({
-          where: { name: { equals: cleanName } },
-          include: { photos: true },
-          take: 1,
-        });
-        // Fallback: toLowerCase match если Prisma не нашла точное совпадение
-        const existingPerson = existingPersons[0]
-          ?? (await prisma.person.findMany({ include: { photos: true } }))
-              .find((p: any) => p.name.toLowerCase() === cleanName.toLowerCase())
-          ?? null;
-
-        let personId: number;
         if (existingPerson) {
-          personId = existingPerson.id;
-          const regResult = await enrollPhotoWithGate(personId, cleanName, category, photo_path, fullPath);
+          const regResult = await enrollPhotoWithGate(existingPerson.id, name, category, photo_path, fullPath);
           const isPrimary = existingPerson.photos.length === 0;
           await prisma.personPhoto.create({
-            data: { person_id: personId, photo_path, is_primary: isPrimary, has_embedding: regResult.hasEmbedding },
+            data: { person_id: existingPerson.id, photo_path, is_primary: isPrimary, has_embedding: regResult.hasEmbedding },
           });
           if (regResult.hasEmbedding) {
-            await prisma.person.update({ where: { id: personId }, data: { embedding_count: { increment: 1 } } });
+            await prisma.person.update({ where: { id: existingPerson.id }, data: { embedding_count: { increment: 1 } } });
           }
           if (isPrimary) {
-            await prisma.person.update({ where: { id: personId }, data: { photo_path } });
+            await prisma.person.update({ where: { id: existingPerson.id }, data: { photo_path } });
           }
-          job.created.push({ name: cleanName, position: existingPerson.position, embeddings: regResult.hasEmbedding ? 1 : 0 });
+          job.results.push({ file: f.originalname, status: 'merged', person_id: existingPerson.id, name, position, photo_path });
         } else {
           const newPerson = await prisma.person.create({
-            data: { name: cleanName, category, position, is_active: true, visit_count: 0, embedding_count: 0 },
+            data: { name, category, position, is_active: true, visit_count: 0, embedding_count: 0 },
           });
-          personId = newPerson.id;
-          const regResult = await enrollPhotoWithGate(personId, cleanName, category, photo_path, fullPath);
+          const regResult = await enrollPhotoWithGate(newPerson.id, name, category, photo_path, fullPath);
           await prisma.personPhoto.create({
-            data: { person_id: personId, photo_path, is_primary: true, has_embedding: regResult.hasEmbedding },
+            data: { person_id: newPerson.id, photo_path, is_primary: true, has_embedding: regResult.hasEmbedding },
           });
           await prisma.person.update({
-            where: { id: personId },
+            where: { id: newPerson.id },
             data: { photo_path, embedding_count: regResult.hasEmbedding ? 1 : 0 },
           });
-          // Sync in-memory
-          const created = await prisma.person.findUnique({ where: { id: personId }, include: { photos: true } });
+          const created = await prisma.person.findUnique({ where: { id: newPerson.id }, include: { photos: true } });
           if (created) persons.unshift({ ...created });
-          job.created.push({ name: cleanName, position, embeddings: regResult.hasEmbedding ? 1 : 0 });
+          personMap.set(dupKey, created);
+          job.results.push({ file: f.originalname, status: 'created', person_id: newPerson.id, name, position, photo_path });
         }
       } catch (err: any) {
-        job.failed.push({ file: f.originalname, error: err.message || 'Ошибка обработки' });
+        job.results.push({ file: f.originalname, status: 'error', error: err.message || 'Ошибка обработки' });
       }
-      job.progress = index + 1;
+      job.processed = index + 1;
+      job.progress = Math.round((job.processed / job.total) * 100);
     }
-    job.status = 'done';
-  }, 100);
 
-  res.json({ job_id: jobId });
+    job.status = 'done';
+  });
+
+  res.json({ success: true, job_id: jobId, message: "Импорт запущен в фоновом режиме" });
 });
 
 app.get(["/api/persons/bulk_import/:job_id", "/api/persons/bulk_import/:job_id/"], (req, res) => {
-  const { job_id } = req.params;
-  const job = importJobs[job_id];
+  const job = importJobs.get(req.params.job_id);
   if (job) {
     res.json(job);
   } else {
@@ -1350,19 +1866,28 @@ app.delete(["/api/persons/:id/photos/:photoId", "/api/persons/:id/photos/:photoI
 
     const photo = await prisma.personPhoto.findUnique({ where: { id: photoId } });
     if (!photo) return res.status(404).json({ detail: "Photo not found" });
+    if (photo.person_id !== id) return res.status(400).json({ detail: "Photo does not belong to this person" });
 
     const photoPath = photo.photo_path;
+    const wasPrimary = photo.is_primary;
+    const hadEmbedding = photo.has_embedding;
+
     await prisma.personPhoto.delete({ where: { id: photoId } });
+
+    if (hadEmbedding) {
+      await removeDescriptorsByPhotoPath(id, photoPath);
+    }
 
     try {
       const fullPath = path.join(photosDir, photoPath);
       if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
     } catch (e) {
-      logError(e as Error, { context: "delete-person-photo-file", path: photoPath });
+      if ((e as any).code !== 'ENOENT') {
+        logError(e as Error, { context: "delete-person-photo-file", path: photoPath });
+      }
     }
 
-    // Если удалили primary — назначаем первую оставшуюся
-    if (photo.is_primary) {
+    if (wasPrimary) {
       const remaining = await prisma.personPhoto.findFirst({ where: { person_id: id }, orderBy: { id: "asc" } });
       if (remaining) {
         await prisma.personPhoto.update({ where: { id: remaining.id }, data: { is_primary: true } });
@@ -1371,6 +1896,9 @@ app.delete(["/api/persons/:id/photos/:photoId", "/api/persons/:id/photos/:photoI
         await prisma.person.update({ where: { id }, data: { photo_path: null } });
       }
     }
+
+    const countNow = getEmbeddingCountForPerson(id);
+    await prisma.person.update({ where: { id }, data: { embedding_count: countNow } }).catch(() => {});
 
     const updated = await prisma.person.findUnique({ where: { id }, include: { photos: true } });
     const idx = persons.findIndex((p) => p.id === id);
@@ -1400,6 +1928,64 @@ app.post(["/api/persons/:id/photos/:photoId/set_primary", "/api/persons/:id/phot
     res.json(updated);
   } catch (err) {
     logError(err as Error, { path: "/api/persons/:id/photos/:photoId/set_primary", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// ── ORPHAN PHOTOS CLEANUP ──
+// Удаляет фото персон, у которых нет эмбеддингов (has_embedding = false).
+// Используется для очистки «мусорных» кадров, которые не прошли ворот качества.
+const ORPHAN_CLEANUP_MIN_AGE_MS = 60 * 60 * 1000; // 1 час
+const ORPHAN_CLEANUP_BATCH = 100;
+
+app.post("/api/persons/cleanup-orphan-photos", async (req, res) => {
+  try {
+    const cutoff = new Date(Date.now() - ORPHAN_CLEANUP_MIN_AGE_MS);
+    const orphans = await prisma.personPhoto.findMany({
+      where: {
+        has_embedding: false,
+        created_at: { lt: cutoff },
+      },
+      include: { person: { select: { id: true, name: true } } },
+    });
+
+    let deletedFiles = 0;
+    let deletedRecords = 0;
+
+    for (let i = 0; i < orphans.length; i += ORPHAN_CLEANUP_BATCH) {
+      const batch = orphans.slice(i, i + ORPHAN_CLEANUP_BATCH);
+      for (const photo of batch) {
+        try {
+          const fullPath = path.join(photosDir, photo.photo_path);
+          if (fs.existsSync(fullPath)) {
+            fs.unlinkSync(fullPath);
+            deletedFiles++;
+          }
+        } catch (e) {
+          if ((e as any).code !== 'ENOENT') {
+            logError(e as Error, { context: "delete-orphan-photo-file", path: photo.photo_path });
+          }
+        }
+
+        await prisma.personPhoto.delete({ where: { id: photo.id } });
+        deletedRecords++;
+      }
+
+      if (i + ORPHAN_CLEANUP_BATCH < orphans.length) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+    }
+
+    logInfo(`[OrphanCleanup] Удалено фото без эмбеддингов: ${deletedRecords} (файлов: ${deletedFiles})`);
+
+    res.json({
+      success: true,
+      deleted_files: deletedFiles,
+      deleted_records: deletedRecords,
+      message: `Удалено ${deletedRecords} фото без эмбеддингов (${deletedFiles} файлов)`,
+    });
+  } catch (err) {
+    logError(err as Error, { path: "/api/persons/cleanup-orphan-photos", method: "POST" });
     res.status(500).json({ detail: "Internal server error" });
   }
 });
@@ -1516,6 +2102,10 @@ async function enrollPhotoWithGate(
   }
 
   const reg = await registerPersonFromDescriptor(personId, personName, category, photo_path, ext.descriptor);
+  if (reg.hasEmbedding) {
+    const count = getEmbeddingCountForPerson(personId);
+    await prisma.person.update({ where: { id: personId }, data: { embedding_count: count } }).catch(() => {});
+  }
   return { hasEmbedding: reg.hasEmbedding, error: reg.error };
 }
 
@@ -1597,6 +2187,9 @@ app.post(["/api/confirmations/:id/approve", "/api/confirmations/:id/approve/"], 
     const reg = await addEmbeddingToPerson(conf.person_id, person.name, person.category, photo_path, descriptor);
     if (!reg.success) return res.status(500).json({ detail: reg.error || "Не удалось добавить дескриптор" });
 
+    const countAfterAdd = getEmbeddingCountForPerson(conf.person_id);
+    await prisma.person.update({ where: { id: conf.person_id }, data: { embedding_count: countAfterAdd } }).catch(() => {});
+
     await prisma.faceConfirmation.update({
       where: { id },
       data: { status: "APPROVED", confirmed_at: new Date(), confirmed_by: operator_id },
@@ -1650,9 +2243,10 @@ app.post(["/api/confirmations/:id/reject", "/api/confirmations/:id/reject/"], as
       await prisma.personPhoto.create({
         data: { person_id: newPerson.id, photo_path, is_primary: true, has_embedding: reg.hasEmbedding },
       });
+      const countForNew = getEmbeddingCountForPerson(newPerson.id);
       await prisma.person.update({
         where: { id: newPerson.id },
-        data: { photo_path, embedding_count: reg.hasEmbedding ? 1 : 0 },
+        data: { photo_path, embedding_count: countForNew },
       });
 
       const created = await prisma.person.findUnique({ where: { id: newPerson.id }, include: { photos: true } });
@@ -1699,12 +2293,16 @@ app.get(["/api/confirmations/stats", "/api/confirmations/stats/"], async (req, r
 app.get(["/api/events", "/api/events/"], async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit as string || "50"), 200);
+    const lastId = parseInt(req.query.last_id as string || "0");
+    const where = lastId > 0 ? { id: { lt: lastId } } : {};
     const eventsFromDB = await prisma.event.findMany({
-      orderBy: { created_at: "desc" },
+      where,
+      orderBy: { id: "desc" },
       take: limit,
       include: { person: { select: { photo_path: true } } },
     });
-    res.json(eventsFromDB);
+    const nextCursor = eventsFromDB.length > 0 ? eventsFromDB[eventsFromDB.length - 1].id : null;
+    res.json({ events: eventsFromDB, next_cursor: nextCursor });
   } catch (err) {
     logError(err as Error, { path: "/api/events", method: "GET" });
     res.status(500).json({ detail: "Internal server error" });
@@ -1898,35 +2496,47 @@ app.get("/api/health", async (req, res) => {
   // Запросим статус у Python-сервера
   try {
     const fetch = (await import('node-fetch')).default;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 2000);
-    const response = await fetch('http://localhost:8001/status', { signal: controller.signal });
-    clearTimeout(timeoutId);
-    if (response.ok) {
-      const pythonStatus = await response.json() as any;
-      const provider = pythonStatus.provider || "CPUExecutionProvider";
-      recognition_provider = `onnxruntime (${provider})`;
-      
-      if (provider !== "CPUExecutionProvider") {
-        gpu_available = true;
-        gpu_detected = true;
-        if (provider.includes("CUDA")) {
-          gpu_name = "NVIDIA GPU";
-          gpu_vendor = "NVIDIA";
-        } else if (provider.includes("Dml")) {
-          gpu_name = "DirectX GPU";
-          gpu_vendor = "DirectML";
-        } else if (provider.includes("OpenVINO")) {
-          gpu_name = "Intel GPU/CPU";
-          gpu_vendor = "Intel";
-        } else if (provider.includes("ROCM")) {
-          gpu_name = "AMD GPU";
-          gpu_vendor = "AMD";
+    let lastError: any;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch('http://localhost:8001/status', { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (response.ok) {
+          const pythonStatus = await response.json() as any;
+          const provider = pythonStatus.provider || "CPUExecutionProvider";
+          recognition_provider = `onnxruntime (${provider})`;
+
+          if (provider !== "CPUExecutionProvider") {
+            gpu_available = true;
+            gpu_detected = true;
+            if (provider.includes("CUDA")) {
+              gpu_name = "NVIDIA GPU";
+              gpu_vendor = "NVIDIA";
+            } else if (provider.includes("Dml")) {
+              gpu_name = "DirectX GPU";
+              gpu_vendor = "DirectML";
+            } else if (provider.includes("OpenVINO")) {
+              gpu_name = "Intel GPU/CPU";
+              gpu_vendor = "Intel";
+            } else if (provider.includes("ROCM")) {
+              gpu_name = "AMD GPU";
+              gpu_vendor = "AMD";
+            }
+            gpu_providers = [provider, "CPUExecutionProvider"];
+            setup_recommendation = `Ускорение через ${provider} активно`;
+          } else {
+            setup_recommendation = "Python-сервер работает в CPU-режиме";
+          }
         }
-        gpu_providers = [provider, "CPUExecutionProvider"];
-        setup_recommendation = `Ускорение через ${provider} активно`;
-      } else {
-        setup_recommendation = "Python-сервер работает в CPU-режиме";
+        break;
+      } catch (err) {
+        clearTimeout(timeoutId);
+        lastError = err;
+        if (attempt < 2) {
+          await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+        }
       }
     }
   } catch (e) {
@@ -2517,7 +3127,7 @@ function getFfmpegPath(): string {
 }
 
 /** Возвращает аргументы ffmpeg ДО спецификации выходного файла (всё, что идёт до -i уже включено). */
-function buildFfmpegInputArgs(cam: any): string[] {
+function buildFfmpegInputArgs(cam: any, transport: "tcp" | "udp" = "tcp"): string[] {
   const isUsb = cam.camera_type === "USB" || /^\d+$/.test((cam.source || "").trim());
   if (isUsb) {
     let inputSource = (cam.source || "").trim();
@@ -2528,8 +3138,20 @@ function buildFfmpegInputArgs(cam: any): string[] {
     }
     return ["-hide_banner", "-loglevel", "error", "-f", "dshow", "-i", `video=${inputSource}`];
   }
-  // RTSP / IP / Hikvision / UNV: подставляем сохранённые учётные данные в URL, если их нет в source
+
   let source = (cam.source || "").trim();
+
+  if (/^rtsp:\/\//i.test(source)) {
+    try {
+      const u = new URL(source);
+      u.searchParams.delete("tcp_transport");
+      u.searchParams.delete("rtsp_transport");
+      source = u.toString();
+    } catch {
+      // ignore invalid URL
+    }
+  }
+
   if (cam.username && cam.password && source && !/:\/\/[^@]+@/.test(source)) {
     try {
       const u = new URL(source);
@@ -2537,11 +3159,17 @@ function buildFfmpegInputArgs(cam: any): string[] {
       u.password = encodeURIComponent(cam.password);
       source = u.toString();
     } catch {
-      // не URL — оставляем как есть
+      // ignore invalid URL
     }
   }
-  // -hide_banner + -loglevel error: не засоряем логи баннером версии/конфигурации на каждом (пере)запуске
-  return ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp", "-timeout", "5000000", "-i", source];
+
+  const args =
+    transport === "udp"
+      ? ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "udp", "-i", source]
+      : ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp", "-timeout", "5000000", "-i", source];
+
+  logDebug(`buildFfmpegInputArgs camera=${cam.id} transport=${transport} source=${source}`);
+  return args;
 }
 
 // Активные записи видео: cameraId -> сессия
@@ -2672,6 +3300,9 @@ const UNKNOWN_PERSON_COOLDOWN_MS = 60_000;
 const lastEventAt = new Map<string, number>();
 // cameraId -> последнее время создания персоны из неизвестного (защита от дублей)
 const lastUnknownPersonAt = new Map<string, number>();
+// Дедупликация событий: camera:person:type -> { eventId, created_at }
+const recentEventDedup = new Map<string, { eventId: number; created_at: number }>();
+const RECENT_EVENT_DEDUP_MS = 15_000;
 
 function saveSnapshotFromFrame(frameBase64: string, cameraId: number, label?: string): string {
   try {
@@ -2707,22 +3338,64 @@ async function persistAndBroadcastEvent(e: {
   confirmationId?: number;
 }) {
   try {
-    await prisma.event.create({
-      data: {
-        camera_id: e.cameraId,
-        camera_name: e.cameraName,
-        person_id: e.personId,
-        event_type: e.event_type,
-        confidence: e.confidence,
-        snapshot_path: e.snapshot_path,
-        person_name: e.person_name,
-        person_category: e.person_category,
-        person_photo_path: e.person_photo_path,
-        needs_operator_confirmation: e.needs_operator_confirmation ?? false,
-        confirmation_status: e.confirmation_status ?? null,
-        confirmation_id: e.confirmationId ?? null,
-      },
-    });
+    let eventId: number | undefined;
+    const now = Date.now();
+
+    if (e.personId && e.event_type !== 'UNKNOWN') {
+      const dedupKey = `${e.cameraId}:${e.personId}:${e.event_type}`;
+      const recent = recentEventDedup.get(dedupKey);
+      if (recent && now - recent.created_at < RECENT_EVENT_DEDUP_MS) {
+        await prisma.event.update({
+          where: { id: recent.eventId },
+          data: {
+            confidence: Math.max(e.confidence, e.confidence),
+            snapshot_path: e.snapshot_path,
+            needs_operator_confirmation: e.needs_operator_confirmation ?? false,
+            confirmation_status: e.confirmation_status ?? null,
+            confirmation_id: e.confirmationId ?? null,
+          },
+        });
+        eventId = recent.eventId;
+      } else {
+        const created = await prisma.event.create({
+          data: {
+            camera_id: e.cameraId,
+            camera_name: e.cameraName,
+            person_id: e.personId,
+            event_type: e.event_type,
+            confidence: e.confidence,
+            snapshot_path: e.snapshot_path,
+            person_name: e.person_name,
+            person_category: e.person_category,
+            person_photo_path: e.person_photo_path,
+            needs_operator_confirmation: e.needs_operator_confirmation ?? false,
+            confirmation_status: e.confirmation_status ?? null,
+            confirmation_id: e.confirmationId ?? null,
+          },
+        });
+        eventId = created.id;
+        recentEventDedup.set(dedupKey, { eventId: created.id, created_at: now });
+      }
+    } else {
+      const created = await prisma.event.create({
+        data: {
+          camera_id: e.cameraId,
+          camera_name: e.cameraName,
+          person_id: e.personId,
+          event_type: e.event_type,
+          confidence: e.confidence,
+          snapshot_path: e.snapshot_path,
+          person_name: e.person_name,
+          person_category: e.person_category,
+          person_photo_path: e.person_photo_path,
+          needs_operator_confirmation: e.needs_operator_confirmation ?? false,
+          confirmation_status: e.confirmation_status ?? null,
+          confirmation_id: e.confirmationId ?? null,
+        },
+      });
+      eventId = created.id;
+    }
+
     broadcastSecurity({
       type: "ALERT",
       category: (e.person_category as any) || "UNKNOWN",
@@ -2784,7 +3457,8 @@ async function handleRecognizedEvent(cam: any, match: any, frameBase64: string) 
     confirmation_status: !meetsVerification ? "pending" : null,
   });
 
-  triggerSmartRecording(cam);
+  // AUTO SMART RECORDING REMOVED — use manual Ctrl+W in LiveMonitor
+  // triggerSmartRecording(cam);
 }
 
 /**
@@ -2893,9 +3567,10 @@ async function createUnknownPersonFromFace(
     data: { person_id: newPerson.id, photo_path, is_primary: true, has_embedding: hasEmbedding },
   });
 
+  const countForUnknown = getEmbeddingCountForPerson(newPerson.id);
   await prisma.person.update({
     where: { id: newPerson.id },
-    data: { photo_path, embedding_count: hasEmbedding ? 1 : 0 },
+    data: { photo_path, embedding_count: countForUnknown },
   });
 
   const created = await prisma.person.findUnique({ where: { id: newPerson.id }, include: { photos: true } });
@@ -2961,13 +3636,18 @@ async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
     person_category: personCategory,
     person_photo_path: personPhotoPath,
   });
-  triggerSmartRecording(cam);
+  // AUTO SMART RECORDING REMOVED — use manual Ctrl+W in LiveMonitor
+  // triggerSmartRecording(cam);
 }
 
 /** Детект → распознавание → обогащение кадра + (debounced) события в БД. */
 async function processDetectedFaces(cam: any, frameBase64: string, faces: any[]): Promise<any[]> {
   const lowT = low_threshold_pct / 100;
   const confirmT = confirmation_threshold_pct / 100;
+  const minFace = cam.min_face_size || 40;
+  const maxFace = cam.max_face_size || 0;
+  const frameW = 640;
+  const frameH = 480;
   const enriched: any[] = [];
   for (let i = 0; i < faces.length; i++) {
     const f = faces[i];
@@ -2977,6 +3657,10 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
     const w = box.width || 0;
     const h = box.height || 0;
     const bbox: [number, number, number, number] = [x, y, x + w, y + h];
+
+    if (h < minFace) continue;
+    if (maxFace > 0 && h > maxFace) continue;
+
     const desc = f.descriptor;
 
     // Ищем до НИЖНЕГО порога бэнда, чтобы поймать кандидатов 40-55% (подтверждение)
@@ -3108,7 +3792,8 @@ async function handleConfirmationEvent(cam: any, match: any, frameBase64: string
       existing_photo: existing_photo_path ? `/${existing_photo_path}` : null,
     });
 
-    triggerSmartRecording(cam);
+    // AUTO SMART RECORDING REMOVED — use manual Ctrl+W in LiveMonitor
+    // triggerSmartRecording(cam);
   } catch (e) {
     logError(e as Error, { context: "handleConfirmationEvent", personId });
   }
@@ -3202,6 +3887,40 @@ wssCamera.on("connection", (ws, req) => {
 const SOI = Buffer.from([0xFF, 0xD8]);
 const EOI = Buffer.from([0xFF, 0xD9]);
 
+// Fallback: камеры, на которых TCP уже падал с -138, след. попытка будет через UDP
+const cameraTransportFallback = new Map<number, "tcp" | "udp">();
+
+// ── Проверка доступности USB-устройства (Windows dshow) ──
+// Кэш результатов для избежания повторных проверок
+const usbDeviceCache = new Map<string, boolean>();
+
+async function isUsbDeviceAvailable(deviceId: string): Promise<boolean> {
+  // deviceId может быть "0", "/dev/video0", "USB Video Device" и т.д.
+  // На Windows dshow ищет по индексу или имени
+  try {
+    // Проверяем кэш
+    if (usbDeviceCache.has(deviceId)) {
+      return usbDeviceCache.get(deviceId)!;
+    }
+    
+    const ffmpegPath = getFfmpegPath();
+    // Используем быстрый список устройств dshow вместо реального захвата
+    const cmd = `"${ffmpegPath}" -y -f dshow -list_devices true -i dummy 2>&1`;
+    const { stdout } = await execAsync(cmd, { timeout: 2000 });
+    
+    // Проверяем наличие устройства в списке
+    const available = stdout.includes(`video=${deviceId}`) ||
+                      stdout.includes(`USB Video Device`) ||
+                      stdout.includes(`Video Device ${deviceId}`);
+    
+    usbDeviceCache.set(deviceId, available);
+    return available;
+  } catch {
+    usbDeviceCache.set(deviceId, false);
+    return false;
+  }
+}
+
 function getFallbackFrame(): string {
   const assetsDir = path.join(__dirname, process.env.NODE_ENV === "production" ? "../public/assets" : "public/assets");
   const rusSrc = path.join(assetsDir, "rus.jpg");
@@ -3211,11 +3930,24 @@ function getFallbackFrame(): string {
   return FALLBACK_JPEG;
 }
 
-function startCameraPipeline(cam: any, fallbackFrame: string) {
+function startCameraPipeline(cam: any, fallbackFrame: string, transportOverride?: "tcp" | "udp") {
   if (!cam.source) return;
 
+  // Проверка доступности USB-устройства перед запуском FFmpeg
+  if (cam.source.startsWith("/dev/video") || cam.camera_type === "USB") {
+    const deviceId = cam.source.replace("/dev/video", "");
+    if (deviceId && /^\d+$/.test(deviceId)) {
+      const available = isUsbDeviceAvailable(deviceId);
+      if (!available) {
+        logWarn(`[Camera ${cam.id}] USB-устройство /dev/video${deviceId} недоступно, пропускаю запуск`);
+        return;
+      }
+    }
+  }
+
+  const transport = transportOverride || cameraTransportFallback.get(cam.id) || "tcp";
   const args = [
-    ...buildFfmpegInputArgs(cam),
+    ...buildFfmpegInputArgs(cam, transport),
     "-f", "mjpeg",
     "-pix_fmt", "yuvj422p",
     "-q:v", "3",
@@ -3226,6 +3958,8 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
 
   try {
     const ffmpegPath = getFfmpegPath();
+    logInfo(`🚀 [Camera ${cam.id}] ЗАПУСК FFmpeg. Аргументы: [${args.join(", ")}]`);
+    logDebug(`[Camera ${cam.id}] Полная команда: ffmpeg ${args.join(" ")}`);
     const proc = spawn(ffmpegPath, args);
     activeFfmpegProcesses.set(cam.id, proc);
     logInfo(`FFmpeg запущен для камеры ${cam.id} (${cam.name})`, { source: cam.source, path: ffmpegPath });
@@ -3267,7 +4001,15 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
       }
     });
 
-    proc.stderr.on("data", (d) => logDebug(`FFmpeg (${cam.id}): ${d.toString().trim()}`));
+    proc.stderr.on("data", (d: Buffer) => {
+      const text = d.toString();
+      logDebug(`FFmpeg (${cam.id}): ${text.trim()}`);
+      // Если TCP упал с ошибкой -138 — помечаем камеру для fallback на UDP
+      if (text.includes("Error number -138") && transport === "tcp") {
+        cameraTransportFallback.set(cam.id, "udp");
+        logWarn(`Камера ${cam.id}: TCP транспорт недоступен (Error -138), следующая попытка через UDP`);
+      }
+    });
 
     proc.on("error", (err) => logError(`Ошибка FFmpeg для камеры ${cam.id}: ${err.message}`));
 
@@ -3297,8 +4039,9 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
         cameraRestartTimers.delete(cam.id);
         const latestCam = cameras.find(c => c.id === cam.id);
         const stillHasClients = (cameraStreams.get(cam.id)?.size ?? 0) > 0;
-        if (latestCam && latestCam.is_active && stillHasClients && !activeFfmpegProcesses.has(cam.id)) {
-          startCameraPipeline(latestCam, fallbackFrame);
+        if (latestCam && latestCam.is_active && stillHasClients && !activeFfmpegProcesses.has(latestCam.id)) {
+          const fallbackTransport = cameraTransportFallback.get(latestCam.id);
+          startCameraPipeline(latestCam, fallbackFrame, fallbackTransport);
         }
       }, delay);
       cameraRestartTimers.set(cam.id, restartTimer);
@@ -3313,6 +4056,83 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
 function startCameraDetection(cam: any, fallbackFrame: string) {
   if (cameraDetectionTimers.has(cam.id)) return;
   let detectionInProgress = false;
+  // v2: Set обработанных bbox-ключей — защита от повторного инференса одного и того же лица
+  const processedKeys = new Set<string>();
+
+  // ── v2: standing-time IoU-tracker (заменяет дребезжащий bbox-key) ──
+  interface Track {
+    id: number;
+    lastBbox: [number, number, number, number];
+    lastCentroid: [number, number];
+    lastMoved: number;   // время последнего ЗНАЧИМОГО смещения
+    lastSeen: number;    // для чистки мёртвых треков
+  }
+  const tracks: Track[] = [];
+  let nextTrackId = 1;
+  const MOVE_EPSILON_PX = 30;   // смещение центра МЕНЬШЕ = покачивание, НЕ сбрасывает стояние
+  const STOP_SMOOTH_MS  = 2000; // «неподвижен» ≥2с → is_stopped (сглаживание дёрганий)
+  const MAX_AGE_MS      = 3000; // трек без детекции 3с → удаляем (защита от утечки)
+  const DWELL_THRESHOLD_SEC = cam.dwell_time_sec ?? 15;
+
+  function centroidOf(b: [number, number, number, number]): [number, number] {
+    if (!b || b.length < 4 || b.some(v => typeof v !== 'number')) return [0, 0];
+    return [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+  }
+  function computeIoU(a: [number, number, number, number], b: [number, number, number, number]): number {
+    if (!a || !b || a.length < 4 || b.length < 4) return 0;
+    const iw = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0]));
+    const ih = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+    const inter = iw * ih;
+    const areaA = (a[2] - a[0]) * (a[3] - a[1]);
+    const areaB = (b[2] - b[0]) * (b[3] - b[1]);
+    const union = areaA + areaB - inter;
+    return union > 0 ? inter / union : 0;
+  }
+  // fallback-ключ: track_id (стабильный) || bbox-центр
+  const keyOf = (f: any) => {
+    if (f.track_id != null) return String(f.track_id);
+    if (f.bbox && f.bbox.length >= 4) return `b${Math.round((f.bbox[0] + f.bbox[2]) / 20)}_${Math.round((f.bbox[1] + f.bbox[3]) / 20)}`;
+    return `b_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  };
+
+  function updateTracks(faces: any[], now: number) {
+    // 1) greedy IoU-matching: детекция ↔ трек (стабильный track_id, не зависит от кванта)
+    const validFaces = (faces as any[]).filter(f => f.bbox && f.bbox.length >= 4);
+    const pairs: { di: number; ti: number; iou: number }[] = [];
+    validFaces.forEach((f, di) => tracks.forEach((t, ti) => {
+      pairs.push({ di, ti, iou: computeIoU(f.bbox, t.lastBbox) });
+    }));
+    pairs.sort((a, b) => b.iou - a.iou);
+    const usedT = new Set<number>(), usedD = new Set<number>();
+    const detTrack = new Map<number, Track>();
+    for (const p of pairs) {
+      if (p.iou < 0.3) break;
+      if (usedD.has(p.di) || usedT.has(p.ti)) continue;
+      detTrack.set(p.di, tracks[p.ti]);
+      usedD.add(p.di); usedT.add(p.ti);
+    }
+    // 2) обновляем matched, создаём новые для unmatched
+    validFaces.forEach((f, di) => {
+      const c = centroidOf(f.bbox);
+      let t = detTrack.get(di);
+      if (!t) {
+        t = { id: nextTrackId++, lastBbox: f.bbox, lastCentroid: c, lastMoved: now, lastSeen: now };
+        tracks.push(t);
+      } else {
+        const moved = Math.hypot(c[0] - t.lastCentroid[0], c[1] - t.lastCentroid[1]) > MOVE_EPSILON_PX;
+        if (moved) t.lastMoved = now;
+        t.lastBbox = f.bbox; t.lastCentroid = c; t.lastSeen = now;
+      }
+      f.track_id = t.id;
+      const standingMs = now - t.lastMoved;
+      f.is_stopped = standingMs >= STOP_SMOOTH_MS;
+      f.dwell_time_sec = standingMs / 1000;
+    });
+    // 3) чистка мёртвых треков
+    for (let i = tracks.length - 1; i >= 0; i--) {
+      if (now - tracks[i].lastSeen > MAX_AGE_MS) tracks.splice(i, 1);
+    }
+  }
 
   const timer = setInterval(async () => {
     if (!activeFfmpegProcesses.has(cam.id)) return;
@@ -3324,8 +4144,36 @@ function startCameraDetection(cam: any, fallbackFrame: string) {
     detectionInProgress = true;
     try {
       const buf = Buffer.from(frameBase64, "base64");
-      const faces = await detectFaces(buf);
-      const enriched = await processDetectedFaces(cam, frameBase64, faces);
+      const faces = await detectFacesWithDistance(buf, cam);
+
+      // v2: standing-time IoU-tracker — вместо дребезжащего bbox-key
+      updateTracks(faces, Date.now());
+
+      // v2: чистим processedKeys от лиц, ушедших из кадра
+      const liveKeys = new Set((faces as any[]).map(f => keyOf(f)));
+      for (const k of processedKeys) { if (!liveKeys.has(k)) processedKeys.delete(k); }
+
+      // v2: proxy-метрики со ВСЕХ лиц — fire-and-forget (сырьё для AI Quality)
+      for (const f of faces as any[]) {
+        recordProxyStat(cam.id, {
+          face_px: faceWidthPx(f.bbox),
+          candidate: !!f.is_stopped,
+        }).catch(() => {});
+      }
+
+      // v2: в распознавание — ТОЛЬКО кандидаты: остановился + dwell >= 15с + зона 2-4м + ещё не обработан
+      const candidates = (faces as any[]).filter((f) =>
+        f.is_stopped === true &&
+        (f.dwell_time_sec ?? 0) >= DWELL_THRESHOLD_SEC &&
+        isInRange(f.distance_m, cam) &&
+        !processedKeys.has(keyOf(f))
+      );
+
+      const enriched = await processDetectedFaces(cam, frameBase64, candidates);
+
+      // v2: помечаем кандидатов как обработанных (независимо от результата распознавания)
+      for (const f of candidates) processedKeys.add(keyOf(f));
+
       const cur = cameraFrames.get(cam.id) || { frame: frameBase64, faces: [] };
       cur.faces = enriched;
       cameraFrames.set(cam.id, cur);
@@ -3357,6 +4205,71 @@ function stopCameraPipeline(cameraId: number) {
   }
   cameraFfmpegRetries.delete(cameraId);
   cameraFrames.delete(cameraId);
+}
+
+function destroyCameraResources(cameraId: number) {
+  // 1. Убиваем FFmpeg-процесс
+  const proc = activeFfmpegProcesses.get(cameraId);
+  if (proc) {
+    try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+    activeFfmpegProcesses.delete(cameraId);
+  }
+
+  // 2. Останавливаем запись видео (если активна)
+  const recSession = activeRecordings.get(cameraId);
+  if (recSession) {
+    try { recSession.proc.kill("SIGKILL"); } catch { /* ignore */ }
+    activeRecordings.delete(cameraId);
+  }
+
+  // 3. Останавливаем таймеры детекции
+  const detTimer = cameraDetectionTimers.get(cameraId);
+  if (detTimer) {
+    clearInterval(detTimer);
+    cameraDetectionTimers.delete(cameraId);
+  }
+
+  // 4. Отменяем отложенный перезапуск и сбрасываем backoff
+  const restartTimer = cameraRestartTimers.get(cameraId);
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+    cameraRestartTimers.delete(cameraId);
+  }
+  cameraFfmpegRetries.delete(cameraId);
+
+  // 5. Сбрасываем fallback-транспорт
+  cameraTransportFallback.delete(cameraId);
+
+  // 6. Закрываем все WebSocket-клиенты камеры
+  const streams = cameraStreams.get(cameraId);
+  if (streams) {
+    for (const ws of streams) {
+      try { ws.close(); } catch { /* ignore */ }
+    }
+    cameraStreams.delete(cameraId);
+  }
+
+  // 6. Удаляем кадр и данные детекции из памяти
+  cameraFrames.delete(cameraId);
+
+  // 7. Удаляем физические файлы записей и снапшотов камеры
+  try {
+    if (fs.existsSync(recordingsDir)) {
+      const recFiles = fs.readdirSync(recordingsDir).filter(f => f.startsWith(`cam${cameraId}_`));
+      for (const f of recFiles) {
+        try { fs.unlinkSync(path.join(recordingsDir, f)); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (fs.existsSync(snapshotsDir)) {
+      const snapFiles = fs.readdirSync(snapshotsDir).filter(f => f.startsWith(`temp_snap_${cameraId}_`) || f === `temp_snap_${cameraId}.jpg`);
+      for (const f of snapFiles) {
+        try { fs.unlinkSync(path.join(snapshotsDir, f)); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
 }
 
 // Upgrade handling for websockets
@@ -3418,17 +4331,22 @@ app.post(["/api/persons/reindex_all", "/api/persons/reindex_all/"], async (req, 
 
         let registered = 0;
         for (const photo of photos) {
-          const fullPath = path.join(publicDir, photo.photo_path);
-          if (!fs.existsSync(fullPath)) continue;
-          const result = await registerFacePerson(
-            person.id, person.name, person.category, photo.photo_path, fullPath
-          );
-          if (result.hasEmbedding) registered++;
+          try {
+            const fullPath = path.join(publicDir, photo.photo_path);
+            if (!fs.existsSync(fullPath)) continue;
+            const result = await registerFacePerson(
+              person.id, person.name, person.category, photo.photo_path, fullPath
+            );
+            if (result.hasEmbedding) registered++;
+          } catch (photoErr: any) {
+            logWarn(`reindex_all: фото "${photo.photo_path}" для "${person.name}" пропущено: ${photoErr?.message || photoErr}`);
+          }
         }
 
+        const actualCount = getEmbeddingCountForPerson(person.id);
         await prisma.person.update({
           where: { id: person.id },
-          data: { embedding_count: registered },
+          data: { embedding_count: actualCount },
         });
 
         success.push(person.name);
@@ -3477,7 +4395,7 @@ app.post(["/api/settings/setup/rerun", "/api/settings/setup/rerun/"], async (req
   try {
     // Форсируем health check Python-сервера и перечитываем GPU статус
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
     let gpuProvider = "CPUExecutionProvider";
     try {
       const r = await (await import("node-fetch")).default(
@@ -3536,9 +4454,7 @@ app.post(["/api/backup", "/api/backup/"], async (req, res) => {
 
     // Создаём ZIP архив с БД и медиафайлами
     const output = fs.createWriteStream(backupPath);
-    const archive = (archiverLib as any).default
-      ? (archiverLib as any).default("zip", { zlib: { level: 6 } })
-      : (archiverLib as any)("zip", { zlib: { level: 6 } });
+    const archive = new (archiverLib as any).ZipArchive({ zlib: { level: 6 } });
 
     await new Promise<void>((resolve, reject) => {
       output.on("close", resolve);
@@ -3567,11 +4483,38 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], upload.single("file"),
 
     if (!fs.existsSync(backupsDir)) fs.mkdirSync(backupsDir, { recursive: true });
 
-    // Сохраняем текущую БД как pre-restore backup
+    // 1. Полная зачистка всех ресурсов камер перед восстановлением
+    const cameraIds = cameras.map(c => c.id);
+    for (const camId of cameraIds) {
+      destroyCameraResources(camId);
+    }
+    cameras = [];
+    persons = [];
+    chronicleData = {};
+    recordingsData = {};
+    activeRecordings.clear();
+    cameraStreams.clear();
+    activeFfmpegProcesses.clear();
+    cameraDetectionTimers.clear();
+    cameraRestartTimers.clear();
+    cameraFfmpegRetries.clear();
+    cameraFrames.clear();
+    cameraTransportFallback.clear();
+    usbDeviceCache.clear();
+    lastEventAt.clear();
+    lastUnknownPersonAt.clear();
+    recentEventDedup.clear();
+
+    // 2. Сохраняем текущую БД как pre-restore backup
     const dbPath = path.join(process.cwd(), "prisma", "dev.db");
     if (fs.existsSync(dbPath)) {
       const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       fs.copyFileSync(dbPath, path.join(backupsDir, `pre_restore_${ts}.db`));
+    }
+
+    // 3. Удаляем старую БД, чтобы restore создал чистую
+    if (fs.existsSync(dbPath)) {
+      fs.unlinkSync(dbPath);
     }
 
     const zipPath = req.file.path;
@@ -3598,8 +4541,14 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], upload.single("file"),
     // Cleanup temp file
     fs.unlinkSync(zipPath);
 
-    logInfo("Backup restored successfully");
-    res.json({ ok: true, message: "Резервная копия восстановлена. Перезагрузите приложение.", errors });
+    // 4. Перезагружаем камеры из восстановленной БД
+    const restoredCameras = await prisma.camera.findMany({ orderBy: { id: "asc" } });
+    cameras = restoredCameras.map((c: any) => ({ ...c, status: c.status || "offline" }));
+    const restoredPersons = await prisma.person.findMany();
+    persons = restoredPersons;
+
+    logInfo("Backup restored successfully — все ресурсы зачищены, камеры перезагружены");
+    res.json({ ok: true, message: "Резервная копия восстановлена. Камеры перезагружены.", errors });
   } catch (err: any) {
     logError(err as Error, { path: "/api/backup/restore" });
     res.json({ ok: false, message: err.message, errors: [err.message] });
@@ -3890,6 +4839,78 @@ async function seedDatabase() {
   logInfo(`Загружено: ${categories.length} категорий, ${persons.length} персон, ${cameras.length} камер`);
 }
 
+// ── Проверка и оптимизация камер при старте ──
+async function validateAndOptimizeCameras(): Promise<void> {
+  logInfo("Проверка доступности камер...");
+  
+  const usbDevicesChecked = new Map<string, boolean>();
+  
+  for (const cam of cameras) {
+    if (!cam.is_active) continue;
+    
+    const isUSB = cam.source?.startsWith("/dev/video") || cam.camera_type === "USB";
+    if (!isUSB) continue;
+    
+    // Извлекаем ID устройства из source (например, "/dev/video0" → "0")
+    const deviceId = cam.source?.replace("/dev/video", "") || "";
+    if (!deviceId || !/^\d+$/.test(deviceId)) continue;
+    
+    // Кэшируем результат проверки для одинаковых устройств
+    if (usbDevicesChecked.has(deviceId)) {
+      const available = usbDevicesChecked.get(deviceId)!;
+      if (!available) {
+        logWarn(`[Camera ${cam.id}] USB-устройство /dev/video${deviceId} недоступно, отключаю камеру`);
+        await prisma.camera.update({
+          where: { id: cam.id },
+          data: { is_active: false, status: "offline" }
+        });
+        cam.is_active = false;
+        cam.status = "offline";
+      }
+      continue;
+    }
+    
+    // Проверяем устройство с коротким таймаутом (1 сек)
+    try {
+      const ffmpegPath = getFfmpegPath();
+      const cmd = `"${ffmpegPath}" -y -f dshow -list_devices true -i dummy 2>&1`;
+      const { stdout } = await execAsync(cmd, { timeout: 3000 });
+      
+      // Проверяем, есть ли устройство в списке dshow
+      const deviceFound = stdout.includes(`video=${deviceId}`) || 
+                          stdout.includes(`video=${deviceId}`) ||
+                          stdout.includes(`Video Device ${deviceId}`) ||
+                          stdout.includes(`USB Video Device`);
+      
+      usbDevicesChecked.set(deviceId, deviceFound);
+      
+      if (!deviceFound) {
+        logWarn(`[Camera ${cam.id}] USB-устройство /dev/video${deviceId} не найдено в dshow, отключаю камеру`);
+        await prisma.camera.update({
+          where: { id: cam.id },
+          data: { is_active: false, status: "offline" }
+        });
+        cam.is_active = false;
+        cam.status = "offline";
+      } else {
+        logInfo(`[Camera ${cam.id}] USB-устройство /dev/video${deviceId} найдено`);
+      }
+    } catch {
+      logWarn(`[Camera ${cam.id}] Не удалось проверить USB-устройство /dev/video${deviceId}, отключаю`);
+      usbDevicesChecked.set(deviceId, false);
+      await prisma.camera.update({
+        where: { id: cam.id },
+        data: { is_active: false, status: "offline" }
+      });
+      cam.is_active = false;
+      cam.status = "offline";
+    }
+  }
+  
+  const activeUSB = cameras.filter(c => c.is_active && (c.source?.startsWith("/dev/video") || c.camera_type === "USB")).length;
+  logInfo(`Проверка камер завершена: ${activeUSB} USB-камер доступно`);
+}
+
 // Middleware для обработки ошибок
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   logError(err, { url: req.url, method: req.method });
@@ -3946,8 +4967,21 @@ async function freePort(port: number): Promise<void> {
 }
 
 async function start() {
+  // Глобальный safety net: не даём серверу упасть из-за одного не пойманного промиса/ошибки
+  process.on('unhandledRejection', (reason: any) => {
+    logError(reason instanceof Error ? reason : new Error(String(reason)), { context: 'unhandledRejection' });
+  });
+  process.on('uncaughtException', (err: Error) => {
+    logError(err, { context: 'uncaughtException' });
+    console.error('❌ Uncaught exception:', err);
+    process.exit(1);
+  });
+
   // Инициализация базы данных
   await seedDatabase();
+
+  // Проверка и оптимизация камер (отключение недоступных USB-устройств)
+  await validateAndOptimizeCameras();
 
   // Подгружаем существующие записи в in-memory архив (календарь «Видеозаписи»)
   try {
@@ -3956,6 +4990,29 @@ async function start() {
     if (existingRecs.length) logInfo(`Загружено в архив записей: ${existingRecs.length}`);
   } catch (e) {
     logError(e as Error, { context: "load recordings to chronicle" });
+  }
+
+  // Ожидание Python-сервера перед инициализацией Face Engine
+  logInfo("Ожидание Python Face Server...");
+  const faceServerUrl = process.env.FACE_SERVER_URL || "http://localhost:8001";
+  let pythonReady = false;
+  for (let i = 0; i < 30; i++) {
+    try {
+      const resp = await fetch(`${faceServerUrl}/health`, { signal: AbortSignal.timeout(2000) });
+      if (resp.ok) {
+        pythonReady = true;
+        logInfo(`Python Face Server доступен (${faceServerUrl})`);
+        break;
+      }
+    } catch {
+      // Сервер ещё не готов
+    }
+    await new Promise(r => setTimeout(r, 1000));
+    if (i % 5 === 4) logInfo(`Ожидание Python Face Server... (${Math.floor((i + 1) / 5)}s)`);
+  }
+  
+  if (!pythonReady) {
+    logWarn(`Python Face Server не доступен через ${faceServerUrl} после 30s — продолжу без него`);
   }
 
   // Инициализация AI движка при старте с загрузкой дескрипторов из БД
@@ -4005,7 +5062,108 @@ async function start() {
 
   server.listen(PORT, HOST, () => {
     logInfo(`Server running on http://${HOST}:${PORT}`);
+    // Синхронный лог для отладки
+    console.log(`[DEBUG] Server.listen callback executed, port ${PORT} should be open`);
+    console.log(`[DEBUG] About to enter post-start setup...`);
+  }).on('error', (err: any) => {
+    logError(err, { context: 'server listen error' });
+    console.error('[DEBUG] Server listen error:', err.message);
   });
+
+  console.log(`[DEBUG] Starting post-server setup...`);
+  try {
+    // Camera health check
+    const cameraHealthStatus = new Map<number, boolean>();
+    const resolveCameraIp = (cam: any): string | null => cam.ip_address || (() => {
+      try {
+        const u = new URL(cam.source || "");
+        return u.hostname || null;
+      } catch {
+        return null;
+      }
+    })();
+
+    setInterval(async () => {
+      try {
+        const activeCameras = cameras.filter(c => c.is_active);
+        for (const cam of activeCameras) {
+          const ipAddress = resolveCameraIp(cam);
+          if (!ipAddress) continue;
+
+          let isOnline = false;
+          try {
+            const { stdout } = await execAsync(`ping -n 1 -w 2000 ${ipAddress}`);
+            isOnline = !stdout.includes('100% packet loss');
+          } catch {
+            isOnline = false;
+          }
+
+          const prev = cameraHealthStatus.get(cam.id);
+          if (prev !== isOnline) {
+            cameraHealthStatus.set(cam.id, isOnline);
+            try {
+              await prisma.camera.update({
+                where: { id: cam.id },
+                data: { status: isOnline ? 'online' : 'offline' }
+              });
+              const idx = cameras.findIndex(c => c.id === cam.id);
+              if (idx >= 0) cameras[idx].status = isOnline ? 'online' : 'offline';
+              logInfo(`Камера ${cam.name} (${ipAddress}) ${isOnline ? 'онлайн' : 'офлайн'}`);
+              broadcastSecurity({
+                type: 'CAMERA_STATUS',
+                camera_id: cam.id,
+                camera_name: cam.name,
+                status: isOnline ? 'online' : 'offline',
+                timestamp: new Date().toISOString()
+              });
+            } catch (err) {
+              logError(err as Error, { context: 'camera health check update', cameraId: cam.id });
+            }
+          }
+        }
+      } catch (err) {
+        logError(err as Error, { context: 'camera health check interval' });
+      }
+    }, 60000);
+
+    // Auto-cleanup orphan photos (no embeddings) — every 24 hours
+    setInterval(async () => {
+      try {
+        const orphans = await prisma.personPhoto.findMany({
+          where: { has_embedding: false },
+          include: { person: { select: { id: true, name: true } } },
+        });
+        if (orphans.length === 0) return;
+
+        let deletedFiles = 0;
+        let deletedRecords = 0;
+
+        for (const photo of orphans) {
+          try {
+            const fullPath = path.join(photosDir, photo.photo_path);
+            if (fs.existsSync(fullPath)) {
+              fs.unlinkSync(fullPath);
+              deletedFiles++;
+            }
+          } catch (e) {
+            logError(e as Error, { context: "auto-delete-orphan-photo-file", path: photo.photo_path });
+          }
+
+          await prisma.personPhoto.delete({ where: { id: photo.id } });
+          deletedRecords++;
+        }
+
+        logInfo(`[AutoCleanup] Удалено фото без эмбеддингов: ${deletedRecords} (файлов: ${deletedFiles})`);
+      } catch (e) {
+        logError(e as Error, { context: "auto-cleanup-orphan-photos" });
+      }
+    }, 24 * 60 * 60 * 1000);
+  } catch (err) {
+    logError(err as Error, { context: 'post-start setup' });
+  }
 }
 
-start();
+start().catch((err) => {
+  console.error('❌ FATAL: start() failed:', err);
+  process.exit(1);
+});
