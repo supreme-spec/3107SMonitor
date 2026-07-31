@@ -210,7 +210,7 @@ const upload = multer({
 
 const uploadZip = multer({
   storage,
-  limits: { fileSize: 1024 * 1024 * 1024 },
+  limits: { fileSize: 4 * 1024 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (file.mimetype === "application/zip" || file.mimetype === "application/octet-stream") {
       cb(null, true);
@@ -4641,26 +4641,35 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], uploadZip.single("file
     const zipPath = req.file.path;
     const errors: string[] = [];
 
+    let dbExtracted = false;
     await new Promise<void>((resolve, reject) => {
       const stream = fs.createReadStream(zipPath)
         .pipe(unzipper.Parse())
         .on("entry", (entry: any) => {
           const fileName: string = entry.path;
           if (fileName === "dev.db") {
-            entry.pipe(fs.createWriteStream(dbPath));
+            const ws = fs.createWriteStream(dbPath);
+            entry.pipe(ws);
+            ws.on("finish", () => { dbExtracted = true; });
           } else if (fileName.startsWith("photos/")) {
             const dest = path.join(photosDir, path.basename(fileName));
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
             entry.pipe(fs.createWriteStream(dest));
           } else if (fileName.startsWith("snapshots/")) {
             const dest = path.join(snapshotsDir, path.basename(fileName));
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
             entry.pipe(fs.createWriteStream(dest));
           } else {
             entry.autodrain();
           }
         })
         .on("error", (err: Error) => {
-          logError(err, { context: "ZIP extraction", path: "/api/backup/restore" });
-          reject(err);
+          if (dbExtracted) {
+            logWarn(`ZIP stream error after DB extracted, continuing: ${err.message}`);
+            resolve();
+          } else {
+            reject(err);
+          }
         });
       stream.on("end", () => resolve());
       stream.on("close", () => resolve());
