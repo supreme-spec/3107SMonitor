@@ -127,6 +127,9 @@ def is_valid_face_position(face_bbox, frame_width: int, frame_height: int) -> bo
 
 MODELS_DIR = Path(__file__).parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
+# InsightFace appends '/models' to the root parameter internally (model_zoo.py:79).
+# So root must point to the parent of models/, i.e., the project directory.
+INSIGHTFACE_ROOT = str(Path(__file__).parent)
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 
@@ -207,7 +210,7 @@ def initialize_face_engine() -> Tuple[Any, str]:
         if target_providers == ["CPUExecutionProvider"]:
             logger.info("Initializing InsightFace on CPU...")
             app_instance = insightface.app.FaceAnalysis(
-                name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
+                name="buffalo_l", root=INSIGHTFACE_ROOT, providers=["CPUExecutionProvider"]
             )
             app_instance.prepare(ctx_id=-1, det_size=(640, 640))
             logger.info("InsightFace loaded on CPU.")
@@ -216,7 +219,7 @@ def initialize_face_engine() -> Tuple[Any, str]:
         try:
             logger.info(f"Attempting GPU initialization with: {target_providers[:-1]}")
             app_instance = insightface.app.FaceAnalysis(
-                name="buffalo_l", root=str(MODELS_DIR), providers=target_providers
+                name="buffalo_l", root=INSIGHTFACE_ROOT, providers=target_providers
             )
             app_instance.prepare(ctx_id=0, det_size=(640, 640))
             used_provider_local = target_providers[0]
@@ -226,7 +229,7 @@ def initialize_face_engine() -> Tuple[Any, str]:
             logger.error(f"GPU initialization failed: {e}")
             logger.warning("Falling back to CPU...")
             app_instance = insightface.app.FaceAnalysis(
-                name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
+                name="buffalo_l", root=INSIGHTFACE_ROOT, providers=["CPUExecutionProvider"]
             )
             app_instance.prepare(ctx_id=-1, det_size=(640, 640))
             logger.info("InsightFace loaded on CPU (compatibility mode).")
