@@ -588,6 +588,12 @@ export async function initFaceEngineWithDB(): Promise<void> {
   await initFaceEngine();
 }
 
+export async function reloadFaceDescriptors(): Promise<{ loaded: number }> {
+  await loadDescriptorsFromDB();
+  await syncIndexWithPython();
+  return { loaded: storedDescriptors.length };
+}
+
 /**
  * Получает статус здоровья Python-сервера.
  */

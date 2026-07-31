@@ -1,26 +1,53 @@
 import "dotenv/config";
 import { PrismaClient } from "@prisma/client";
 
-// Singleton Prisma client — prevents multiple connections in dev hot-reload
 declare global {
-  // eslint-disable-next-line no-var
   var __prisma: PrismaClient | undefined;
 }
 
-export const prisma =
-  global.__prisma ??
-  new PrismaClient({
+let prismaInstance: PrismaClient | undefined = global.__prisma;
+
+if (!prismaInstance) {
+  prismaInstance = new PrismaClient({
     log:
       process.env.NODE_ENV === "development"
         ? ["warn", "error"]
         : ["error"],
   });
-
-if (process.env.NODE_ENV !== "production") {
-  global.__prisma = prisma;
+  if (process.env.NODE_ENV !== "production") {
+    global.__prisma = prismaInstance;
+  }
 }
 
-// Graceful shutdown
+export const prisma = new Proxy(prismaInstance, {
+  get(target, prop) {
+    return prismaInstance[prop as keyof PrismaClient];
+  },
+  set(target, prop, value) {
+    (prismaInstance as any)[prop as keyof PrismaClient] = value;
+    return true;
+  },
+  has(target, prop) {
+    return prop in prismaInstance;
+  },
+});
+
+export async function reconnectPrisma(): Promise<void> {
+  await prismaInstance.$disconnect();
+  prismaInstance = new PrismaClient({
+    log:
+      process.env.NODE_ENV === "development"
+        ? ["warn", "error"]
+        : ["error"],
+  });
+  if (process.env.NODE_ENV !== "production") {
+    global.__prisma = prismaInstance;
+  }
+  if (process.env.NODE_ENV !== "production") {
+    console.log("[db.ts] Prisma reconnected after DB restore");
+  }
+}
+
 process.on("beforeExit", async () => {
-  await prisma.$disconnect();
+  await prismaInstance.$disconnect();
 });

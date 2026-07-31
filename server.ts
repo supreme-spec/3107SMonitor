@@ -44,9 +44,10 @@ import {
   searchByDescriptor,
   addEmbeddingToPerson,
   getEmbeddingCountForPerson,
-  removeDescriptorsByPhotoPath,
+   removeDescriptorsByPhotoPath,
+   reloadFaceDescriptors,
 } from "./face-engine.js";
-import { prisma } from "./db.js";
+import { prisma, reconnectPrisma } from "./db.js";
 import logger, { logInfo, logError, logWarn, logDebug } from "./src/lib/logger.js";
 import { recordProxyStat } from "./src/lib/ai-quality.js";
 import { isInRange, faceWidthPx } from "./src/lib/detection-helpers.js";
@@ -200,6 +201,18 @@ const upload = multer({
   },
   fileFilter: (req, file, cb) => {
     if (ALLOWED_IMAGE_MIME.has(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Недопустимый тип файла: ${file.mimetype}`));
+    }
+  },
+});
+
+const uploadZip = multer({
+  storage,
+  limits: { fileSize: 1024 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === "application/zip" || file.mimetype === "application/octet-stream") {
       cb(null, true);
     } else {
       cb(new Error(`Недопустимый тип файла: ${file.mimetype}`));
@@ -1749,6 +1762,8 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
       job.progress = Math.round((job.processed / job.total) * 100);
     }
 
+    // Синхронизируем FAISS индекс после завершения всех импортов
+    await rebuildDescriptorIndex(persons);
     job.status = 'done';
   });
 
@@ -4582,7 +4597,7 @@ app.post(["/api/backup", "/api/backup/"], async (req, res) => {
   }
 });
 
-app.post(["/api/backup/restore", "/api/backup/restore/"], upload.single("file"), async (req, res) => {
+app.post(["/api/backup/restore", "/api/backup/restore/"], uploadZip.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, message: "Файл не загружен" });
 
@@ -4617,7 +4632,8 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], upload.single("file"),
       fs.copyFileSync(dbPath, path.join(backupsDir, `pre_restore_${ts}.db`));
     }
 
-    // 3. Удаляем старую БД, чтобы restore создал чистую
+    // 3. Отключаем Prisma и удаляем старую БД (Windows требует закрытия соединения)
+    await prisma.$disconnect();
     if (fs.existsSync(dbPath)) {
       fs.unlinkSync(dbPath);
     }
@@ -4646,11 +4662,18 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], upload.single("file"),
     // Cleanup temp file
     fs.unlinkSync(zipPath);
 
-    // 4. Перезагружаем камеры из восстановленной БД
+    // 4. Переподключаем Prisma к восстановленной БД
+    await reconnectPrisma();
+
+    // 5. Перезагружаем камеры из восстановленной БД
     const restoredCameras = await prisma.camera.findMany({ orderBy: { id: "asc" } });
     cameras = restoredCameras.map((c: any) => ({ ...c, status: c.status || "offline" }));
     const restoredPersons = await prisma.person.findMany();
     persons = restoredPersons;
+
+    // 6. Перезагружаем дескрипторы лиц в память и синхронизируем FAISS
+    const reloadResult = await reloadFaceDescriptors();
+    logInfo(`Face descriptors reloaded after restore: ${reloadResult.loaded} vectors`);
 
     logInfo("Backup restored successfully — все ресурсы зачищены, камеры перезагружены");
     res.json({ ok: true, message: "Резервная копия восстановлена. Камеры перезагружены.", errors });
