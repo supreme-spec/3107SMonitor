@@ -34,9 +34,9 @@ import {
   detectFacesFast,
   getEmbedding,
   extractEmbedding,
-  registerPerson as registerFacePerson,
+  registerPerson,
   registerPersonFromDescriptor,
-  unregisterPerson as unregisterFacePerson,
+  unregisterPerson,
   searchByPhoto,
   rebuildDescriptorIndex,
   getEngineStatus,
@@ -46,6 +46,7 @@ import {
   getEmbeddingCountForPerson,
    removeDescriptorsByPhotoPath,
    reloadFaceDescriptors,
+   syncIndexWithPython,
 } from "./face-engine.js";
 import { prisma, reconnectPrisma } from "./db.js";
 import logger, { logInfo, logError, logWarn, logDebug } from "./src/lib/logger.js";
@@ -1626,7 +1627,7 @@ app.delete(["/api/persons/:id", "/api/persons/:id/"], async (req, res) => {
     const id = parseInt(req.params.id);
 
     // Удаляем дескрипторы
-    await unregisterFacePerson(id);
+    await unregisterPerson(id);
 
     // Удаляем персону
     await prisma.person.delete({ where: { id } });
@@ -1646,7 +1647,7 @@ app.post(["/api/persons/bulk_delete", "/api/persons/bulk_delete/"], async (req, 
     const ids = req.body as number[];
     if (!Array.isArray(ids)) return res.status(400).json({ detail: "Invalid request body" });
     // Unregister face descriptors for each person
-    await Promise.all(ids.map(id => unregisterFacePerson(id)));
+    await Promise.all(ids.map(id => unregisterPerson(id)));
     const deleted = await prisma.person.deleteMany({ where: { id: { in: ids } } });
     persons = persons.filter((p) => !ids.includes(p.id));
     res.json({ success: true, count: deleted.count });
@@ -2223,6 +2224,8 @@ async function enrollPhotoWithGate(
 
   const reg = await registerPersonFromDescriptor(personId, personName, category, photo_path, ext.descriptor);
   if (reg.hasEmbedding) {
+    // Принудительная синхронизация FAISS-индекса после добавления эмбеддинга
+    await syncIndexWithPython().catch((e) => logWarn("FAISS sync skipped", { error: (e as Error).message }));
     const count = getEmbeddingCountForPerson(personId);
     await prisma.person.update({ where: { id: personId }, data: { embedding_count: count } }).catch(() => {});
   }
@@ -2359,7 +2362,7 @@ app.post(["/api/confirmations/:id/reject", "/api/confirmations/:id/reject/"], as
       });
       newPersonId = newPerson.id;
 
-      const reg = await registerFacePerson(newPerson.id, "Неизвестный", "CLIENT", photo_path, path.join(publicDir, photo_path));
+      const reg = await registerPerson(newPerson.id, "Неизвестный", "CLIENT", photo_path, path.join(publicDir, photo_path));
       await prisma.personPhoto.create({
         data: { person_id: newPerson.id, photo_path, is_primary: true, has_embedding: reg.hasEmbedding },
       });
@@ -3675,11 +3678,16 @@ async function createUnknownPersonFromFace(
   let hasEmbedding = false;
   if (descriptorArr && descriptorArr.length) {
     // Основной путь: регистрируем по уже вычисленному дескриптору
-    const reg = await registerPersonFromDescriptor(newPerson.id, "Неизвестный", "CLIENT", photo_path, descriptorArr);
+    // descriptorArr — это number[], нужно конвертировать в Buffer (4 байта на float32)
+    const descriptorBuffer = Buffer.allocUnsafe(descriptorArr.length * 4);
+    for (let i = 0; i < descriptorArr.length; i++) {
+      descriptorBuffer.writeFloatLE(descriptorArr[i], i * 4);
+    }
+    const reg = await registerPerson(newPerson.id, "Неизвестный", "CLIENT", photo_path, descriptorBuffer);
     hasEmbedding = reg.hasEmbedding;
   } else {
     // Fallback: пытаемся извлечь из обрезанного кадра (может не сработать на мелких лицах)
-    const reg = await registerFacePerson(newPerson.id, "Неизвестный", "CLIENT", photo_path, fullPath);
+    const reg = await registerPerson(newPerson.id, "Неизвестный", "CLIENT", photo_path, fullPath);
     hasEmbedding = reg.hasEmbedding;
   }
 
@@ -4447,14 +4455,14 @@ app.post(["/api/persons/reindex_all", "/api/persons/reindex_all/"], async (req, 
       try {
         // Удаляем старые дескрипторы
         await prisma.faceDescriptor.deleteMany({ where: { person_id: person.id } });
-        await unregisterFacePerson(person.id);
+        await unregisterPerson(person.id);
 
         let registered = 0;
         for (const photo of photos) {
           try {
             const fullPath = path.join(publicDir, photo.photo_path);
             if (!fs.existsSync(fullPath)) continue;
-            const result = await registerFacePerson(
+            const result = await registerPerson(
               person.id, person.name, person.category, photo.photo_path, fullPath
             );
             if (result.hasEmbedding) registered++;
@@ -4580,9 +4588,16 @@ app.post(["/api/backup", "/api/backup/"], async (req, res) => {
       output.on("close", resolve);
       archive.on("error", reject);
       archive.pipe(output);
-      // БД
+      
+      // БД и WAL-файлы для полной целостности
       const dbPath = path.join(process.cwd(), "prisma", "dev.db");
+      const walPath = dbPath + "-wal";
+      const shmPath = dbPath + "-shm";
+      
       if (fs.existsSync(dbPath)) archive.file(dbPath, { name: "dev.db" });
+      if (fs.existsSync(walPath)) archive.file(walPath, { name: "dev.db-wal" });
+      if (fs.existsSync(shmPath)) archive.file(shmPath, { name: "dev.db-shm" });
+      
       // Фото и снапшоты
       if (fs.existsSync(photosDir)) archive.directory(photosDir, "photos");
       if (fs.existsSync(snapshotsDir)) archive.directory(snapshotsDir, "snapshots");
@@ -4632,8 +4647,10 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], uploadZip.single("file
       fs.copyFileSync(dbPath, path.join(backupsDir, `pre_restore_${ts}.db`));
     }
 
-    // 3. Отключаем Prisma и удаляем старую БД (Windows требует закрытия соединения)
+    // 3. Отключаем Prisma и удаляем старую БД и WAL-файлы (Windows требует закрытия соединения)
     await prisma.$disconnect();
+    
+    // Удаляем основную БД
     if (fs.existsSync(dbPath)) {
       let dbDeleted = false;
       for (let attempt = 0; attempt < 5 && !dbDeleted; attempt++) {
@@ -4646,34 +4663,73 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], uploadZip.single("file
         }
       }
     }
+    
+    // Удаляем WAL-файлы для целостности
+    const walPath = dbPath + "-wal";
+    const shmPath = dbPath + "-shm";
+    if (fs.existsSync(walPath)) {
+      try { fs.unlinkSync(walPath); } catch (e: any) { logWarn(`Failed to delete WAL file: ${e.message}`); }
+    }
+    if (fs.existsSync(shmPath)) {
+      try { fs.unlinkSync(shmPath); } catch (e: any) { logWarn(`Failed to delete SHM file: ${e.message}`); }
+    }
 
     const zipPath = req.file.path;
     const errors: string[] = [];
 
+    // 4. Распаковка ZIP с правильной обработкой потоков
     let dbExtracted = false;
+    let dbWriteFinished = false;
+
+    let dbEntryFound = false;
+    let walEntryFound = false;
+    let shmEntryFound = false;
+    
     await new Promise<void>((resolve, reject) => {
       const stream = fs.createReadStream(zipPath)
         .pipe(unzipper.Parse())
         .on("entry", (entry: any) => {
           const fileName: string = entry.path;
           if (fileName === "dev.db") {
-            const ws = fs.createWriteStream(dbPath);
-            entry.pipe(ws);
-            ws.on("finish", () => { dbExtracted = true; });
+            dbEntryFound = true;
+            const dbStream = fs.createWriteStream(dbPath);
+            entry.pipe(dbStream);
+            
+            dbStream.on("finish", () => { dbExtracted = true; });
+            dbStream.on("close", () => { dbWriteFinished = true; });
+            dbStream.on("error", reject);
+          } else if (fileName === "dev.db-wal") {
+            walEntryFound = true;
+            const walStream = fs.createWriteStream(dbPath + "-wal");
+            entry.pipe(walStream).on("error", (err: Error) => {
+              logWarn(`Failed to extract WAL file: ${err.message}`);
+            });
+          } else if (fileName === "dev.db-shm") {
+            shmEntryFound = true;
+            const shmStream = fs.createWriteStream(dbPath + "-shm");
+            entry.pipe(shmStream).on("error", (err: Error) => {
+              logWarn(`Failed to extract SHM file: ${err.message}`);
+            });
           } else if (fileName.startsWith("photos/")) {
             const dest = path.join(photosDir, path.basename(fileName));
             fs.mkdirSync(path.dirname(dest), { recursive: true });
-            entry.pipe(fs.createWriteStream(dest));
+            entry.pipe(fs.createWriteStream(dest)).on("error", (err: Error) => {
+              logWarn(`Failed to extract photo ${fileName}: ${err.message}`);
+              errors.push(`Photo extraction failed: ${fileName}`);
+            });
           } else if (fileName.startsWith("snapshots/")) {
             const dest = path.join(snapshotsDir, path.basename(fileName));
             fs.mkdirSync(path.dirname(dest), { recursive: true });
-            entry.pipe(fs.createWriteStream(dest));
+            entry.pipe(fs.createWriteStream(dest)).on("error", (err: Error) => {
+              logWarn(`Failed to extract snapshot ${fileName}: ${err.message}`);
+              errors.push(`Snapshot extraction failed: ${fileName}`);
+            });
           } else {
             entry.autodrain();
           }
         })
         .on("error", (err: Error) => {
-          if (dbExtracted) {
+          if (dbExtracted && dbWriteFinished) {
             logWarn(`ZIP stream error after DB extracted, continuing: ${err.message}`);
             resolve();
           } else {
@@ -4684,21 +4740,86 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], uploadZip.single("file
       stream.on("close", () => resolve());
     });
 
+    // Ждём завершения записи БД
+    if (!dbEntryFound) {
+      throw new Error("Database file 'dev.db' not found in ZIP archive");
+    }
+    
+    // Даём время на завершение файловых операций
+    await new Promise(r => setTimeout(r, 100));
+
+    // Логируем статус WAL-файлов
+    if (walEntryFound || shmEntryFound) {
+      logInfo(`WAL files found in archive: WAL=${walEntryFound}, SHM=${shmEntryFound}`);
+    } else {
+      logInfo("No WAL files in archive - backup was created without active transactions");
+    }
+
+    // 5. Валидация целостности БД
+    if (!fs.existsSync(dbPath)) {
+      throw new Error("Database file does not exist after extraction");
+    }
+    
+    const dbStats = fs.statSync(dbPath);
+    if (dbStats.size === 0) {
+      throw new Error("Database file is empty after extraction");
+    }
+    
+    if (dbStats.size < 1024) { // Меньше 1KB - явно повреждён
+      throw new Error(`Database file is too small (${dbStats.size} bytes), likely corrupted`);
+    }
+    
+    logInfo(`Database extracted successfully: ${dbStats.size} bytes`);
+
     // Cleanup temp file
     fs.unlinkSync(zipPath);
 
-    // 4. Переподключаем Prisma к восстановленной БД
+    // 6. Обработка WAL-файлов если они есть
+    if (walEntryFound || shmEntryFound) {
+      try {
+        // Просто удаляем WAL-файлы после распаковки, так как SQLite сам восстановится
+        // без них при следующем подключении
+        if (fs.existsSync(walPath)) {
+          fs.unlinkSync(walPath);
+          logInfo("WAL file removed after extraction");
+        }
+        if (fs.existsSync(shmPath)) {
+          fs.unlinkSync(shmPath);
+          logInfo("SHM file removed after extraction");
+        }
+      } catch (walErr: any) {
+        logWarn(`WAL file cleanup failed: ${walErr.message}, continuing without it`);
+      }
+    }
+
+    // 7. Переподключаем Prisma к восстановленной БД
     await reconnectPrisma();
 
-    // 5. Перезагружаем камеры из восстановленной БД
+    // 8. Валидация БД после переподключения
+    try {
+      const dbCheck = await prisma.$queryRaw`SELECT COUNT(*) as count FROM sqlite_master WHERE type='table'`;
+      logInfo(`Database validation passed: ${dbCheck[0]?.count || 0} tables found`);
+    } catch (dbErr: any) {
+      throw new Error(`Database validation failed after reconnect: ${dbErr.message}`);
+    }
+
+    // 9. Перезагружаем камеры из восстановленной БД
     const restoredCameras = await prisma.camera.findMany({ orderBy: { id: "asc" } });
     cameras = restoredCameras.map((c: any) => ({ ...c, status: c.status || "offline" }));
     const restoredPersons = await prisma.person.findMany();
     persons = restoredPersons;
 
-    // 6. Перезагружаем дескрипторы лиц в память и синхронизируем FAISS
+    // 10. Проверяем наличие эмбеддингов в БД
+    const embeddingCount = await prisma.faceDescriptor.count();
+    logInfo(`Found ${embeddingCount} face descriptors in restored database`);
+
+    // 11. Перезагружаем дескрипторы лиц в память и синхронизируем FAISS
     const reloadResult = await reloadFaceDescriptors();
-    logInfo(`Face descriptors reloaded after restore: ${reloadResult.loaded} vectors`);
+    logInfo(`Face descriptors reloaded after restore: ${reloadResult.loaded} vectors (DB count: ${embeddingCount})`);
+    
+    if (reloadResult.loaded === 0 && embeddingCount > 0) {
+      logWarn("Warning: Database contains embeddings but none were loaded into memory - possible parsing issue");
+    }
 
     logInfo("Backup restored successfully — все ресурсы зачищены, камеры перезагружены");
     res.json({ ok: true, message: "Резервная копия восстановлена. Камеры перезагружены.", errors });

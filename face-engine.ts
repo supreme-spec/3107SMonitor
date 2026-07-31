@@ -949,7 +949,7 @@ async function recognizeDescriptorOnServer(
   }
 }
 
-async function syncIndexWithPython(): Promise<void> {
+export async function syncIndexWithPython(): Promise<void> {
   if (faissSyncStatus === 'SYNCING') return;
 
   faissSyncStatus = 'SYNCING';

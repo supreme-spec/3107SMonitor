@@ -20,7 +20,7 @@ export default defineConfig(() => {
       hmr: process.env.DISABLE_HMR !== 'true',
       watch: process.env.DISABLE_HMR === 'true' ? null : {
         // Игнорируем постоянно меняющиеся логи/билды, чтобы не дёргать HMR лишний раз
-        ignored: ['**/logs/**', '**/node_modules/**', '**/.git/**', '**/dist/**'],
+         ignored: ['**/logs/**', '**/node_modules/**', '**/.git/**', '**/dist/**', '**/backups/**', '**/models/**', '**/public/photos/**'],
       },
       proxy: {
         '/api': {
