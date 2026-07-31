@@ -29,17 +29,24 @@ if "ORT_NUM_THREADS" not in os.environ:
 import cv2
 import numpy as np
 
-# ── v2: distance estimation helpers ──
-try:
-    import importlib.util, sys
-    spec = importlib.util.spec_from_file_location("distance", "face_server/distance.py")
-    distance_mod = importlib.util.module_from_spec(spec)
-    sys.modules["distance"] = distance_mod
-    spec.loader.exec_module(distance_mod)
-    estimate_depth_m = distance_mod.estimate_depth_m
-    bbox_in_roi_polygon = distance_mod.bbox_in_roi_polygon
-except Exception:
-    pass
+# ── v2: distance estimation helpers (optional) ──
+ENABLE_DISTANCE = os.getenv("FACE_ENABLE_DISTANCE", "false") == "true"
+estimate_depth_m = None
+bbox_in_roi_polygon = None
+
+if ENABLE_DISTANCE:
+    try:
+        import importlib.util, sys
+        spec = importlib.util.spec_from_file_location("distance", "face_server/distance.py")
+        distance_mod = importlib.util.module_from_spec(spec)
+        sys.modules["distance"] = distance_mod
+        spec.loader.exec_module(distance_mod)
+        estimate_depth_m = distance_mod.estimate_depth_m
+        bbox_in_roi_polygon = distance_mod.bbox_in_roi_polygon
+        logger.info("Distance estimation module loaded successfully")
+    except Exception as e:
+        logger.warning(f"Failed to load distance module: {e}")
+        ENABLE_DISTANCE = False
 import faiss
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
@@ -85,6 +92,7 @@ BRIGHTNESS_TO_LUX: float = float(os.getenv("FACE_BRIGHTNESS_TO_LUX", "0.8"))
 ENABLE_PREPROCESS: bool = os.getenv("FACE_ENABLE_PREPROCESS", "1") not in ("0", "false", "False")
 API_KEY: str = os.getenv("FACE_API_KEY", "")
 DB_PATH: str = os.getenv("DB_PATH", "prisma/dev.db")
+GPU_INIT_TIMEOUT: int = int(os.getenv("FACE_GPU_INIT_TIMEOUT_SECONDS", "15"))
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -764,9 +772,24 @@ async def detect_faces(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── v2: детекция с distance-расчётом ──
+# ── v2: детекция с distance-расчётом (optional) ──
 @app.post("/detect-with-distance", dependencies=[Depends(verify_api_key)])
 async def detect_with_distance(
+    image: UploadFile = File(...),
+    max_faces: Optional[int] = 20,
+    min_confidence: Optional[float] = None,
+    with_descriptors: Optional[bool] = False,
+    distance_calib_mode: Optional[str] = None,
+    roi_polygon: Optional[str] = None,
+    distance_min_m: Optional[float] = None,
+    distance_max_m: Optional[float] = None,
+    distance_ignore_m: Optional[float] = None,
+    focal_length_px: Optional[float] = None,
+):
+    """Detects faces + estimates distance using the ladder calib method."""
+    if not ENABLE_DISTANCE:
+        raise HTTPException(status_code=501, detail="Distance estimation is disabled. Set FACE_ENABLE_DISTANCE=true in .env")
+    try:
     image: UploadFile = File(...),
     max_faces: Optional[int] = 20,
     min_confidence: Optional[float] = None,
