@@ -41,7 +41,7 @@ try:
 except Exception:
     pass
 import faiss
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
@@ -954,7 +954,7 @@ async def assess_quality(image: UploadFile = File(...)):
 @app.post("/get-embedding", dependencies=[Depends(verify_api_key)])
 async def get_embedding(
     image: UploadFile = File(...),
-    strict: Optional[bool] = False,
+    strict: Optional[bool] = Form(False),
 ):
     """
     Extracts face embedding from image.

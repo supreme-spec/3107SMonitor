@@ -4641,23 +4641,30 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], uploadZip.single("file
     const zipPath = req.file.path;
     const errors: string[] = [];
 
-    await fs.createReadStream(zipPath)
-      .pipe(unzipper.Parse())
-      .on("entry", (entry: any) => {
-        const fileName: string = entry.path;
-        if (fileName === "dev.db") {
-          entry.pipe(fs.createWriteStream(dbPath));
-        } else if (fileName.startsWith("photos/")) {
-          const dest = path.join(photosDir, path.basename(fileName));
-          entry.pipe(fs.createWriteStream(dest));
-        } else if (fileName.startsWith("snapshots/")) {
-          const dest = path.join(snapshotsDir, path.basename(fileName));
-          entry.pipe(fs.createWriteStream(dest));
-        } else {
-          entry.autodrain();
-        }
-      })
-      .promise();
+    await new Promise<void>((resolve, reject) => {
+      const stream = fs.createReadStream(zipPath)
+        .pipe(unzipper.Parse())
+        .on("entry", (entry: any) => {
+          const fileName: string = entry.path;
+          if (fileName === "dev.db") {
+            entry.pipe(fs.createWriteStream(dbPath));
+          } else if (fileName.startsWith("photos/")) {
+            const dest = path.join(photosDir, path.basename(fileName));
+            entry.pipe(fs.createWriteStream(dest));
+          } else if (fileName.startsWith("snapshots/")) {
+            const dest = path.join(snapshotsDir, path.basename(fileName));
+            entry.pipe(fs.createWriteStream(dest));
+          } else {
+            entry.autodrain();
+          }
+        })
+        .on("error", (err: Error) => {
+          logError(err, { context: "ZIP extraction", path: "/api/backup/restore" });
+          reject(err);
+        });
+      stream.on("end", () => resolve());
+      stream.on("close", () => resolve());
+    });
 
     // Cleanup temp file
     fs.unlinkSync(zipPath);
@@ -4679,7 +4686,7 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], uploadZip.single("file
     res.json({ ok: true, message: "Резервная копия восстановлена. Камеры перезагружены.", errors });
   } catch (err: any) {
     logError(err as Error, { path: "/api/backup/restore" });
-    res.json({ ok: false, message: err.message, errors: [err.message] });
+    res.status(500).json({ ok: false, message: err.message, errors: [err.message] });
   }
 });
 
