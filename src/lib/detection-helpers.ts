@@ -6,4 +6,7 @@ export function isInRange(d: number | null | undefined, cam: any): boolean {
     const mx  = cam.distance_max_m    ?? 4.0;
     return d >= ign && d >= mn && d <= mx;
 }
-export const faceWidthPx = (b: [number, number, number, number]) => Math.max(1, b[2] - b[0]);
+export const faceWidthPx = (b: any): number => {
+    if (!b || !Array.isArray(b) || b.length < 4) return 0;
+    return Math.max(1, b[2] - b[0]);
+};

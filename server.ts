@@ -212,7 +212,7 @@ const uploadZip = multer({
   storage,
   limits: { fileSize: 4 * 1024 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    if (file.mimetype === "application/zip" || file.mimetype === "application/octet-stream") {
+    if (["application/zip", "application/x-zip-compressed", "application/octet-stream"].includes(file.mimetype)) {
       cb(null, true);
     } else {
       cb(new Error(`Недопустимый тип файла: ${file.mimetype}`));
@@ -1366,9 +1366,9 @@ app.get(["/api/persons", "/api/persons/"], async (req, res) => {
     if (category) where.category = category;
     if (search) {
       where.OR = [
-        { name: { contains: search, mode: "insensitive" } },
-        { comment: { contains: search, mode: "insensitive" } },
-        { organization: { contains: search, mode: "insensitive" } },
+        { name: { contains: search } },
+        { comment: { contains: search } },
+        { organization: { contains: search } },
       ];
     }
 
@@ -4635,7 +4635,16 @@ app.post(["/api/backup/restore", "/api/backup/restore/"], uploadZip.single("file
     // 3. Отключаем Prisma и удаляем старую БД (Windows требует закрытия соединения)
     await prisma.$disconnect();
     if (fs.existsSync(dbPath)) {
-      fs.unlinkSync(dbPath);
+      let dbDeleted = false;
+      for (let attempt = 0; attempt < 5 && !dbDeleted; attempt++) {
+        try {
+          fs.unlinkSync(dbPath);
+          dbDeleted = true;
+        } catch (e: any) {
+          if (attempt === 4) throw e;
+          await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+        }
+      }
     }
 
     const zipPath = req.file.path;
@@ -5057,14 +5066,18 @@ async function validateAndOptimizeCameras(): Promise<void> {
 
 // Middleware для обработки ошибок
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err instanceof SyntaxError && (err as any).status === 400 && 'body' in err) {
+    logError(err, { url: req.url, method: req.method, context: "JSON parse error" });
+    return res.status(400).json({
+      detail: "Неверный JSON в теле запроса",
+    });
+  }
   logError(err, { url: req.url, method: req.method });
-  
   res.status(err.status || 500).json({
     detail: err.message || "Внутренняя ошибка сервера",
     error: process.env.NODE_ENV === "development" ? err : undefined,
   });
 });
-
 /**
  * Освобождает порт перед запуском: завершает процесс, который его занимает.
  * Это гарантирует чистый старт даже если остался висеть старый инстанс
